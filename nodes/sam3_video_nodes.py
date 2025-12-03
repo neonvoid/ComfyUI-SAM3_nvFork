@@ -576,15 +576,19 @@ class SAM3VideoOutput:
                     "default": True,
                     "tooltip": "Show all object masks in visualization (True) or only selected obj_id (False)"
                 }),
+                "draw_legend": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Draw legend on visualization (disable for faster processing)"
+                }),
             }
         }
 
     @classmethod
-    def IS_CHANGED(cls, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True):
+    def IS_CHANGED(cls, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True, draw_legend=True):
         # Always re-run this node when params change, but this is cheap
         # The key is that changing these here does NOT invalidate upstream cache
         # ComfyUI caches based on input values - masks/video_state don't change
-        return (id(masks), video_state.session_uuid, id(scores), obj_id, plot_all_masks)
+        return (id(masks), video_state.session_uuid, id(scores), obj_id, plot_all_masks, draw_legend)
 
     RETURN_TYPES = ("MASK", "IMAGE", "IMAGE")
     RETURN_NAMES = ("masks", "frames", "visualization")
@@ -592,13 +596,12 @@ class SAM3VideoOutput:
     CATEGORY = "SAM3/video"
 
     def _draw_legend(self, vis_frame, num_objects, colors, obj_id=-1, frame_scores=None):
-        """Draw a legend showing object IDs, colors, and confidence scores (sorted by confidence)."""
+        """Draw a legend showing object IDs and colors using vectorized operations."""
         h, w = vis_frame.shape[:2]
 
         # Legend parameters
         box_size = max(16, min(32, h // 20))
         padding = max(4, box_size // 4)
-        text_width = box_size * 6  # Space for "X: 0.95"
         legend_item_height = box_size + padding
 
         # Build list of (obj_id, score) pairs
@@ -614,85 +617,43 @@ class SAM3VideoOutput:
 
         num_items = len(items)
         legend_height = num_items * legend_item_height + padding
-        legend_width = box_size + text_width + padding * 2
+        legend_width = box_size + padding * 2
 
         # Position in top-left corner
         start_x = padding
         start_y = padding
 
-        # Draw semi-transparent background
-        bg_alpha = 0.7
-        for y in range(start_y, min(start_y + legend_height, h)):
-            for x in range(start_x, min(start_x + legend_width, w)):
-                vis_frame[y, x] = vis_frame[y, x] * (1 - bg_alpha) + torch.tensor([0.1, 0.1, 0.1]) * bg_alpha
+        # Clamp bounds to image size
+        end_y = min(start_y + legend_height, h)
+        end_x = min(start_x + legend_width, w)
 
-        # Draw legend items (already sorted by confidence)
+        # Draw semi-transparent background using vectorized operation
+        bg_color = torch.tensor([0.1, 0.1, 0.1])
+        bg_alpha = 0.7
+        vis_frame[start_y:end_y, start_x:end_x] = (
+            vis_frame[start_y:end_y, start_x:end_x] * (1 - bg_alpha) + bg_color * bg_alpha
+        )
+
+        # Draw legend items using vectorized operations
         for idx, (oid, score) in enumerate(items):
             item_y = start_y + padding + idx * legend_item_height
+            box_end_y = min(item_y + box_size, h)
+            box_start_x = start_x + padding
+            box_end_x = min(box_start_x + box_size, w)
 
-            # Draw color box
+            # Draw color box using tensor slicing (vectorized)
             color = torch.tensor(colors[oid % len(colors)])
-            for y in range(item_y, min(item_y + box_size, h)):
-                for x in range(start_x + padding, min(start_x + padding + box_size, w)):
-                    vis_frame[y, x] = color
-
-            # Draw "X: 0.95" text using simple pixel font
-            text_x = start_x + padding + box_size + padding
-            if score is not None:
-                # Format score to 2 decimal places
-                score_str = f"{oid}:{score:.2f}"
-            else:
-                score_str = f"{oid}"
-            self._draw_text(vis_frame, score_str, text_x, item_y, box_size)
+            vis_frame[item_y:box_end_y, box_start_x:box_end_x] = color
 
         return vis_frame
 
-    def _draw_text(self, img, text, x, y, size):
-        """Draw simple text using basic shapes (no font dependencies)."""
-        # Simple 3x5 pixel font for digits and punctuation
-        chars = {
-            '0': [[1,1,1], [1,0,1], [1,0,1], [1,0,1], [1,1,1]],
-            '1': [[0,1,0], [1,1,0], [0,1,0], [0,1,0], [1,1,1]],
-            '2': [[1,1,1], [0,0,1], [1,1,1], [1,0,0], [1,1,1]],
-            '3': [[1,1,1], [0,0,1], [1,1,1], [0,0,1], [1,1,1]],
-            '4': [[1,0,1], [1,0,1], [1,1,1], [0,0,1], [0,0,1]],
-            '5': [[1,1,1], [1,0,0], [1,1,1], [0,0,1], [1,1,1]],
-            '6': [[1,1,1], [1,0,0], [1,1,1], [1,0,1], [1,1,1]],
-            '7': [[1,1,1], [0,0,1], [0,0,1], [0,0,1], [0,0,1]],
-            '8': [[1,1,1], [1,0,1], [1,1,1], [1,0,1], [1,1,1]],
-            '9': [[1,1,1], [1,0,1], [1,1,1], [0,0,1], [1,1,1]],
-            ':': [[0,0,0], [0,1,0], [0,0,0], [0,1,0], [0,0,0]],
-            '.': [[0,0,0], [0,0,0], [0,0,0], [0,0,0], [0,1,0]],
-        }
-
-        h, w = img.shape[:2]
-        scale = max(1, size // 6)
-        char_width = 4 * scale
-
-        curr_x = x
-        for char in text:
-            if char in chars:
-                pattern = chars[char]
-                for row_idx, row in enumerate(pattern):
-                    for col_idx, pixel in enumerate(row):
-                        if pixel:
-                            for sy in range(scale):
-                                for sx in range(scale):
-                                    px = curr_x + col_idx * scale + sx
-                                    py = y + row_idx * scale + sy
-                                    if 0 <= px < w and 0 <= py < h:
-                                        img[py, px] = torch.tensor([1.0, 1.0, 1.0])
-                curr_x += char_width
-            elif char == ' ':
-                curr_x += char_width  # Space
-
-    def extract(self, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True):
+    def extract(self, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True, draw_legend=True):
         """Extract all masks as a batch [N, H, W]."""
         from PIL import Image
         import os
 
         # Create cache key
-        cache_key = (id(masks), video_state.session_uuid, id(scores), obj_id, plot_all_masks)
+        cache_key = (id(masks), video_state.session_uuid, id(scores), obj_id, plot_all_masks, draw_legend)
 
         # Check if we have cached result
         if cache_key in SAM3VideoOutput._cache:
@@ -816,8 +777,8 @@ class SAM3VideoOutput:
                 if frame_mask.numel() == 0:
                     frame_mask = torch.zeros(h, w)
 
-                # Draw legend on visualization
-                if num_objects > 0:
+                # Draw legend on visualization (skip if disabled for performance)
+                if draw_legend and num_objects > 0:
                     legend_obj_id = -1 if plot_all_masks else obj_id
                     # Get scores for this frame
                     frame_scores = None

@@ -32,7 +32,7 @@ class SAM3MaskTracks:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "masks": ("SAM3_MASKS", {
+                "masks": ("SAM3_VIDEO_MASKS", {
                     "tooltip": "Mask dictionary from SAM3Propagate"
                 }),
                 "video_state": ("SAM3_VIDEO_STATE", {
@@ -40,7 +40,7 @@ class SAM3MaskTracks:
                 }),
             },
             "optional": {
-                "scores": ("SAM3_SCORES", {
+                "scores": ("SAM3_VIDEO_SCORES", {
                     "tooltip": "Optional scores dictionary from SAM3Propagate"
                 }),
                 "min_visible_pixels": ("INT", {

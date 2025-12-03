@@ -119,7 +119,8 @@ class Sam3VideoPredictor:
         else:
             raise RuntimeError(f"invalid request type: {request_type}")
 
-    def start_session(self, resource_path, session_id=None):
+    def start_session(self, resource_path, session_id=None,
+                      offload_video_to_cpu=True, offload_state_to_cpu=False):
         """
         Start a new inference session on an image or a video. Here `resource_path`
         can be either a path to an image file (for image inference) or an MP4 file
@@ -128,13 +129,22 @@ class Sam3VideoPredictor:
         If `session_id` is defined, it will be used as identifier for the
         session. If it is not defined, the start_session function will create
         a session id and return it.
+
+        Args:
+            resource_path: Path to image file, MP4 file, or directory with JPEG frames
+            session_id: Optional session identifier
+            offload_video_to_cpu: Store video frames on CPU to save VRAM (default: True)
+            offload_state_to_cpu: Store inference state on CPU to save VRAM (default: False, slower)
         """
         print_vram("Before init_state")
+        print(f"[SAM3 Video] Memory offload: video_to_cpu={offload_video_to_cpu}, state_to_cpu={offload_state_to_cpu}")
         # get an initial inference_state from the model
         inference_state = self.model.init_state(
             resource_path=resource_path,
             async_loading_frames=self.async_loading_frames,
             video_loader_type=self.video_loader_type,
+            offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
         )
         print_vram("After init_state")
         if not session_id:

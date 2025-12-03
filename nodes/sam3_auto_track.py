@@ -151,6 +151,15 @@ class SAM3AutoTrack:
                     "default": False,
                     "tooltip": "Move model to CPU after detection to free VRAM"
                 }),
+                # Memory offload options for long videos
+                "offload_video_to_cpu": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Store video frames on CPU (minor overhead, saves ~1-2GB VRAM)"
+                }),
+                "offload_state_to_cpu": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Store inference state on CPU (10-15% slower, saves ~3-5GB VRAM for long videos)"
+                }),
             }
         }
 
@@ -204,7 +213,8 @@ class SAM3AutoTrack:
     def auto_track(self, sam3_model, video_frames, text_prompt: str,
                    keyframe_interval: int = 30, confidence_threshold: float = 0.2,
                    iou_threshold: float = 0.3, max_objects: int = -1,
-                   score_threshold: float = 0.3, offload_model: bool = False):
+                   score_threshold: float = 0.3, offload_model: bool = False,
+                   offload_video_to_cpu: bool = True, offload_state_to_cpu: bool = False):
         """
         Perform automatic multi-instance detection and tracking setup.
         """
@@ -227,10 +237,13 @@ class SAM3AutoTrack:
         print(f"[SAM3 AutoTrack]   Keyframe interval: {keyframe_interval}")
         print(f"[SAM3 AutoTrack]   Confidence threshold: {confidence_threshold}")
         print(f"[SAM3 AutoTrack]   IoU threshold: {iou_threshold}")
+        print(f"[SAM3 AutoTrack]   Memory offload: video={offload_video_to_cpu}, state={offload_state_to_cpu}")
 
         # 1. Create video state
         config = VideoConfig(
             score_threshold_detection=score_threshold,
+            offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
         )
         video_state = create_video_state(video_frames, config=config)
 

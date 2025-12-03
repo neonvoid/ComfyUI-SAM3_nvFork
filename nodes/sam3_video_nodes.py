@@ -155,6 +155,15 @@ class SAM3VideoSegmentation:
                     "step": 0.05,
                     "tooltip": "Detection confidence threshold"
                 }),
+                # Memory offload options
+                "offload_video_to_cpu": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Store video frames on CPU (minor overhead, saves ~1-2GB VRAM)"
+                }),
+                "offload_state_to_cpu": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Store inference state on CPU (10-15% slower, saves ~3-5GB VRAM for long videos)"
+                }),
             }
         }
 
@@ -162,7 +171,8 @@ class SAM3VideoSegmentation:
     def IS_CHANGED(cls, video_frames, prompt_mode="text", text_prompt="",
                    positive_points=None, negative_points=None,
                    positive_boxes=None, negative_boxes=None,
-                   frame_idx=0, score_threshold=0.3):
+                   frame_idx=0, score_threshold=0.3,
+                   offload_video_to_cpu=True, offload_state_to_cpu=False):
         # Use a stable hash based on video content
         # Don't use float(mean()) - it has floating point precision issues on GPU
         import hashlib
@@ -192,6 +202,8 @@ class SAM3VideoSegmentation:
             str(negative_boxes),
             frame_idx,
             score_threshold,
+            offload_video_to_cpu,
+            offload_state_to_cpu,
         ))
         print(f"[IS_CHANGED DEBUG] SAM3VideoSegmentation: video_hash={video_hash}, prompt_mode={prompt_mode}")
         print(f"[IS_CHANGED DEBUG] SAM3VideoSegmentation: positive_points={positive_points}")
@@ -207,7 +219,8 @@ class SAM3VideoSegmentation:
     def segment(self, video_frames, prompt_mode="text", text_prompt="",
                 positive_points=None, negative_points=None,
                 positive_boxes=None, negative_boxes=None,
-                frame_idx=0, score_threshold=0.3):
+                frame_idx=0, score_threshold=0.3,
+                offload_video_to_cpu=True, offload_state_to_cpu=False):
         """Initialize video state and add prompts based on selected mode."""
         # Create cache key from inputs
         import hashlib
@@ -228,6 +241,8 @@ class SAM3VideoSegmentation:
         h.update(str(id(negative_boxes)).encode() if negative_boxes else b"none")
         h.update(str(frame_idx).encode())
         h.update(str(score_threshold).encode())
+        h.update(str(offload_video_to_cpu).encode())
+        h.update(str(offload_state_to_cpu).encode())
         cache_key = h.hexdigest()
 
         # Check if we have cached result
@@ -242,6 +257,8 @@ class SAM3VideoSegmentation:
         # 1. Initialize video state
         config = VideoConfig(
             score_threshold_detection=score_threshold,
+            offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
         )
         video_state = create_video_state(
             video_frames=video_frames,
@@ -479,11 +496,13 @@ class SAM3Propagate:
                             break
 
                     if mask_key:
-                        # Move masks to CPU immediately to free GPU memory
+                        # Move masks to CPU immediately to free GPU memory (streaming pattern)
                         mask = outputs[mask_key]
                         if hasattr(mask, 'cpu'):
                             mask = mask.cpu()
                         masks_dict[frame_idx] = mask
+                        # Clear GPU reference
+                        del outputs[mask_key]
 
                     # Capture confidence scores
                     for score_key in ["out_probs", "scores", "confidences", "obj_scores"]:
@@ -494,12 +513,19 @@ class SAM3Propagate:
                             elif isinstance(probs, np.ndarray):
                                 probs = torch.from_numpy(probs)
                             scores_dict[frame_idx] = probs
+                            # Clear GPU reference
+                            del outputs[score_key]
                             break
 
-                    # Periodic cleanup and VRAM monitoring
-                    if frame_idx % 10 == 0:
-                        print_vram(f"Frame {frame_idx}")
+                    # Clear remaining outputs to free GPU memory
+                    outputs.clear()
+
+                    # Periodic cleanup and VRAM monitoring (every 16 frames like streaming VAE)
+                    if frame_idx % 16 == 0:
                         gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        print_vram(f"Frame {frame_idx}")
 
             except Exception as e:
                 print(f"[SAM3 Video] Propagation error: {e}")

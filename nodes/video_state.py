@@ -155,6 +155,9 @@ class VideoConfig:
     hotstart_delay: int = 15
     decrease_keep_alive_empty: bool = False
     suppress_unmatched_globally: bool = False
+    # Memory offload options (reduce VRAM usage for long videos)
+    offload_video_to_cpu: bool = True  # Store video frames on CPU (minor overhead)
+    offload_state_to_cpu: bool = False  # Store inference state on CPU (slower but saves ~3-5GB)
 
 
 @dataclass(frozen=True)

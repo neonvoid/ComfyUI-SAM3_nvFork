@@ -98,9 +98,12 @@ class InferenceReconstructor:
         self._apply_config(model, video_state.config)
 
         # Initialize fresh inference state - this stores state in predictor's _ALL_INFERENCE_STATES
+        # Pass offload options from config to reduce VRAM usage
         inference_state = model.start_session(
             resource_path=video_state.temp_dir,
-            session_id=video_state.session_uuid
+            session_id=video_state.session_uuid,
+            offload_video_to_cpu=video_state.config.offload_video_to_cpu,
+            offload_state_to_cpu=video_state.config.offload_state_to_cpu,
         )
         print_vram("After start_session")
 

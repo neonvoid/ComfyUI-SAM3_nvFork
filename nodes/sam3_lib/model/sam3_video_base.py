@@ -1529,6 +1529,7 @@ class Sam3VideoBase(nn.Module):
         orig_vid_height: int,
         orig_vid_width: int,
         feature_cache: Dict,
+        offload_state_to_cpu: bool = False,
     ):
         """Add a new object to SAM2 inference states."""
         prev_tracker_state = (
@@ -1543,6 +1544,7 @@ class Sam3VideoBase(nn.Module):
             video_height=orig_vid_height,
             video_width=orig_vid_width,
             num_frames=num_frames,
+            offload_state_to_cpu=offload_state_to_cpu,
         )
         new_tracker_state["backbone_out"] = (
             prev_tracker_state.get("backbone_out", None)

@@ -791,6 +791,7 @@ class Sam3VideoInference(Sam3VideoBase):
             orig_vid_height=inference_state["orig_height"],
             orig_vid_width=inference_state["orig_width"],
             feature_cache=inference_state["feature_cache"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
         # Synthesize obj_id_to_mask data for cached_frame_outputs to support _build_tracker_output during warmup

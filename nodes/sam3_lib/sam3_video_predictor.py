@@ -139,13 +139,16 @@ class Sam3VideoPredictor:
         print_vram("Before init_state")
         print(f"[SAM3 Video] Memory offload: video_to_cpu={offload_video_to_cpu}, state_to_cpu={offload_state_to_cpu}")
         # get an initial inference_state from the model
+        # NOTE: Sam3VideoInference.init_state() only accepts offload_video_to_cpu
+        # offload_state_to_cpu is for tracker states, stored separately and passed through later
         inference_state = self.model.init_state(
             resource_path=resource_path,
             async_loading_frames=self.async_loading_frames,
             video_loader_type=self.video_loader_type,
             offload_video_to_cpu=offload_video_to_cpu,
-            offload_state_to_cpu=offload_state_to_cpu,
         )
+        # Store offload_state_to_cpu for later use when creating tracker inference states
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
         print_vram("After init_state")
         if not session_id:
             session_id = str(uuid.uuid4())

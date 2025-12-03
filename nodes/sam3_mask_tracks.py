@@ -227,7 +227,21 @@ class SAM3SelectMask:
     - object_ids="0" → Just object 0's mask [N_frames, H, W]
     - object_ids="0,2" + combine_mode="union" → Combined mask of objects 0 and 2
     - object_ids="all" + combine_mode="separate" → All masks [N_frames, N_obj, H, W]
+
+    Optionally provide video_frames to get a colored visualization overlay.
     """
+
+    # Color palette for visualization (RGB, 0-1 range)
+    COLORS = [
+        [0.0, 0.5, 1.0],   # Blue
+        [1.0, 0.3, 0.3],   # Red
+        [0.3, 1.0, 0.3],   # Green
+        [1.0, 1.0, 0.0],   # Yellow
+        [1.0, 0.0, 1.0],   # Magenta
+        [0.0, 1.0, 1.0],   # Cyan
+        [1.0, 0.5, 0.0],   # Orange
+        [0.5, 0.0, 1.0],   # Purple
+    ]
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -242,19 +256,66 @@ class SAM3SelectMask:
                 }),
             },
             "optional": {
+                "video_frames": ("IMAGE", {
+                    "tooltip": "Optional video frames for visualization overlay [N, H, W, C]"
+                }),
                 "combine_mode": (["union", "separate", "first"], {
                     "default": "union",
                     "tooltip": "How to combine multiple objects: union (OR), separate (keep channels), first (just first selected)"
                 }),
+                "viz_alpha": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Mask overlay transparency for visualization (0=invisible, 1=opaque)"
+                }),
             }
         }
 
-    RETURN_TYPES = ("MASK", "STRING")
-    RETURN_NAMES = ("selected_masks", "selected_ids")
+    RETURN_TYPES = ("MASK", "STRING", "IMAGE")
+    RETURN_NAMES = ("selected_masks", "selected_ids", "visualization")
     FUNCTION = "select"
     CATEGORY = "SAM3/video"
 
-    def select(self, all_masks, object_ids="all", combine_mode="union"):
+    def _create_visualization(self, frames, masks, valid_ids, alpha=0.5):
+        """Create colored mask overlay on video frames."""
+        num_frames = frames.shape[0]
+        h, w = frames.shape[1], frames.shape[2]
+        vis_list = []
+
+        for frame_idx in range(num_frames):
+            vis_frame = frames[frame_idx].clone()
+
+            # Handle different mask shapes
+            if masks.dim() == 3:
+                # Single combined mask [N_frames, H, W]
+                frame_mask = masks[frame_idx].float()
+                if frame_mask.max() > 1.0:
+                    frame_mask = frame_mask / 255.0
+
+                # Use first color for combined mask
+                color = torch.tensor(self.COLORS[0])
+                mask_rgb = frame_mask.unsqueeze(-1) * color.view(1, 1, 3)
+                vis_frame = vis_frame * (1 - alpha * frame_mask.unsqueeze(-1)) + alpha * mask_rgb
+
+            elif masks.dim() == 4:
+                # Multi-object masks [N_frames, N_objects, H, W]
+                for idx, oid in enumerate(valid_ids):
+                    if oid < masks.shape[1]:
+                        obj_mask = masks[frame_idx, oid].float()
+                        if obj_mask.max() > 1.0:
+                            obj_mask = obj_mask / 255.0
+
+                        color = torch.tensor(self.COLORS[idx % len(self.COLORS)])
+                        mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
+                        vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
+
+            vis_list.append(vis_frame.clamp(0, 1))
+
+        return torch.stack(vis_list, dim=0)
+
+    def select(self, all_masks, object_ids="all", video_frames=None, combine_mode="union", viz_alpha=0.5):
         """
         Select and optionally combine object masks.
         """
@@ -262,7 +323,13 @@ class SAM3SelectMask:
         if all_masks.dim() == 3:
             # Already [N_frames, H, W] - single object, just return
             print(f"[SAM3 SelectMask] Input is single-object mask, returning as-is")
-            return (all_masks, "0")
+            num_frames, h, w = all_masks.shape
+            # Create visualization if frames provided
+            if video_frames is not None:
+                visualization = self._create_visualization(video_frames, all_masks, [0], viz_alpha)
+            else:
+                visualization = torch.zeros(num_frames, h, w, 3)
+            return (all_masks, "0", visualization)
 
         if all_masks.dim() != 4:
             raise ValueError(f"Expected 4D tensor [N_frames, N_objects, H, W], got shape {all_masks.shape}")
@@ -290,8 +357,12 @@ class SAM3SelectMask:
         print(f"[SAM3 SelectMask] Selecting objects: {valid_ids}, mode: {combine_mode}")
 
         if not valid_ids:
-            # No objects - return empty mask
-            return (torch.zeros(num_frames, h, w), "")
+            # No objects - return empty mask and visualization
+            empty_mask = torch.zeros(num_frames, h, w)
+            empty_vis = torch.zeros(num_frames, h, w, 3)
+            if video_frames is not None:
+                empty_vis = video_frames.clone()
+            return (empty_mask, "", empty_vis)
 
         # Select and combine based on mode
         if combine_mode == "union":
@@ -299,7 +370,7 @@ class SAM3SelectMask:
             selected = torch.zeros(num_frames, h, w, device=all_masks.device)
             for oid in valid_ids:
                 selected = torch.max(selected, all_masks[:, oid])
-            return (selected, ",".join(str(i) for i in valid_ids))
+            ids_str = ",".join(str(i) for i in valid_ids)
 
         elif combine_mode == "separate":
             # Keep as separate channels
@@ -307,19 +378,35 @@ class SAM3SelectMask:
             # If only one object, squeeze to [N_frames, H, W]
             if len(valid_ids) == 1:
                 selected = selected.squeeze(1)
-            return (selected, ",".join(str(i) for i in valid_ids))
+            ids_str = ",".join(str(i) for i in valid_ids)
 
         elif combine_mode == "first":
             # Just return the first selected object
             selected = all_masks[:, valid_ids[0]]
-            return (selected, str(valid_ids[0]))
+            ids_str = str(valid_ids[0])
 
         else:
             # Default to union
             selected = torch.zeros(num_frames, h, w, device=all_masks.device)
             for oid in valid_ids:
                 selected = torch.max(selected, all_masks[:, oid])
-            return (selected, ",".join(str(i) for i in valid_ids))
+            ids_str = ",".join(str(i) for i in valid_ids)
+
+        # Create visualization if frames provided
+        if video_frames is not None:
+            # For visualization, use the selected masks (may be multi-channel if separate)
+            if combine_mode == "separate" and selected.dim() == 4:
+                visualization = self._create_visualization(video_frames, selected, list(range(len(valid_ids))), viz_alpha)
+            else:
+                visualization = self._create_visualization(video_frames, selected, valid_ids, viz_alpha)
+        else:
+            # Return empty visualization with correct shape
+            if selected.dim() == 3:
+                visualization = torch.zeros(num_frames, h, w, 3)
+            else:
+                visualization = torch.zeros(num_frames, h, w, 3)
+
+        return (selected, ids_str, visualization)
 
 
 # Node registration

@@ -70,19 +70,23 @@ class SAM3PointCollector:
         """
         Collect points from interactive canvas
 
+        Supports both single-object (legacy) and multi-object formats.
+
         Args:
             image: ComfyUI image tensor [B, H, W, C]
-            points_store: Combined JSON storage (hidden widget)
-            coordinates: Positive points JSON (hidden widget)
-            neg_coordinates: Negative points JSON (hidden widget)
+            points_store: Combined JSON storage (hidden widget) - may contain 'objects' key for multi-object
+            coordinates: Positive points JSON (hidden widget) - legacy format
+            neg_coordinates: Negative points JSON (hidden widget) - legacy format
 
         Returns:
             Tuple of (positive_points, negative_points) as separate SAM3_POINTS_PROMPT outputs
+            For multi-object mode, positive_points will contain an 'objects' key with per-object data
         """
         # Create cache key from inputs
         import hashlib
         h = hashlib.md5()
         h.update(str(image.shape).encode())
+        h.update(points_store.encode())
         h.update(coordinates.encode())
         h.update(neg_coordinates.encode())
         cache_key = h.hexdigest()
@@ -100,42 +104,94 @@ class SAM3PointCollector:
 
         print(f"[SAM3 Point Collector] CACHE MISS - computing new result for key={cache_key[:8]}")
 
-        # Parse coordinates from JSON
-        try:
-            pos_coords = json.loads(coordinates) if coordinates and coordinates.strip() else []
-            neg_coords = json.loads(neg_coordinates) if neg_coordinates and neg_coordinates.strip() else []
-        except json.JSONDecodeError:
-            pos_coords = []
-            neg_coords = []
-
-        print(f"[SAM3 Point Collector] Collected {len(pos_coords)} positive, {len(neg_coords)} negative points")
-
         # Get image dimensions for normalization
         img_height, img_width = image.shape[1], image.shape[2]
         print(f"[SAM3 Point Collector] Image dimensions: {img_width}x{img_height}")
 
-        # Convert to SAM3 point format - separate positive and negative outputs
-        # SAM3 expects normalized coordinates (0-1), so divide by image dimensions
-        positive_points = {"points": [], "labels": []}
-        negative_points = {"points": [], "labels": []}
+        # Parse points_store to check for multi-object format
+        try:
+            store_data = json.loads(points_store) if points_store and points_store.strip() else {}
+        except json.JSONDecodeError:
+            store_data = {}
 
-        # Add positive points (label = 1) - normalize to 0-1
-        for p in pos_coords:
-            normalized_x = p['x'] / img_width
-            normalized_y = p['y'] / img_height
-            positive_points["points"].append([normalized_x, normalized_y])
-            positive_points["labels"].append(1)
-            print(f"[SAM3 Point Collector]   Positive point: ({p['x']:.1f}, {p['y']:.1f}) -> ({normalized_x:.3f}, {normalized_y:.3f})")
+        # Check for multi-object format (new v9 widget)
+        if "objects" in store_data and len(store_data["objects"]) > 0:
+            # MULTI-OBJECT MODE
+            print(f"[SAM3 Point Collector] Multi-object mode: {len(store_data['objects'])} objects detected")
 
-        # Add negative points (label = 0) - normalize to 0-1
-        for n in neg_coords:
-            normalized_x = n['x'] / img_width
-            normalized_y = n['y'] / img_height
-            negative_points["points"].append([normalized_x, normalized_y])
-            negative_points["labels"].append(0)
-            print(f"[SAM3 Point Collector]   Negative point: ({n['x']:.1f}, {n['y']:.1f}) -> ({normalized_x:.3f}, {normalized_y:.3f})")
+            # Build multi-object output format
+            multi_objects = []
+            total_pos = 0
+            total_neg = 0
 
-        print(f"[SAM3 Point Collector] Output: {len(positive_points['points'])} positive, {len(negative_points['points'])} negative")
+            for obj_data in store_data["objects"]:
+                obj_id = obj_data.get("obj_id", 1)
+                pos_pts = obj_data.get("positive_points", [])
+                neg_pts = obj_data.get("negative_points", [])
+
+                # Normalize coordinates to 0-1
+                normalized_pos = []
+                for pt in pos_pts:
+                    # Points from JS are [x, y] arrays
+                    if isinstance(pt, list) and len(pt) >= 2:
+                        normalized_pos.append([pt[0] / img_width, pt[1] / img_height])
+
+                normalized_neg = []
+                for pt in neg_pts:
+                    if isinstance(pt, list) and len(pt) >= 2:
+                        normalized_neg.append([pt[0] / img_width, pt[1] / img_height])
+
+                multi_objects.append({
+                    "obj_id": obj_id,
+                    "positive_points": normalized_pos,
+                    "negative_points": normalized_neg
+                })
+
+                total_pos += len(normalized_pos)
+                total_neg += len(normalized_neg)
+                print(f"[SAM3 Point Collector]   Object {obj_id}: {len(normalized_pos)} positive, {len(normalized_neg)} negative points")
+
+            print(f"[SAM3 Point Collector] Multi-object output: {len(multi_objects)} objects, {total_pos} total positive, {total_neg} total negative")
+
+            # Output format: positive_points contains 'objects' key for multi-object mode
+            # negative_points is empty dict (all negatives are in objects)
+            positive_points = {"objects": multi_objects}
+            negative_points = {"points": [], "labels": []}  # Empty - negatives are per-object
+
+        else:
+            # LEGACY SINGLE-OBJECT MODE
+            # Parse coordinates from JSON
+            try:
+                pos_coords = json.loads(coordinates) if coordinates and coordinates.strip() else []
+                neg_coords = json.loads(neg_coordinates) if neg_coordinates and neg_coordinates.strip() else []
+            except json.JSONDecodeError:
+                pos_coords = []
+                neg_coords = []
+
+            print(f"[SAM3 Point Collector] Legacy mode: {len(pos_coords)} positive, {len(neg_coords)} negative points")
+
+            # Convert to SAM3 point format - separate positive and negative outputs
+            # SAM3 expects normalized coordinates (0-1), so divide by image dimensions
+            positive_points = {"points": [], "labels": []}
+            negative_points = {"points": [], "labels": []}
+
+            # Add positive points (label = 1) - normalize to 0-1
+            for p in pos_coords:
+                normalized_x = p['x'] / img_width
+                normalized_y = p['y'] / img_height
+                positive_points["points"].append([normalized_x, normalized_y])
+                positive_points["labels"].append(1)
+                print(f"[SAM3 Point Collector]   Positive point: ({p['x']:.1f}, {p['y']:.1f}) -> ({normalized_x:.3f}, {normalized_y:.3f})")
+
+            # Add negative points (label = 0) - normalize to 0-1
+            for n in neg_coords:
+                normalized_x = n['x'] / img_width
+                normalized_y = n['y'] / img_height
+                negative_points["points"].append([normalized_x, normalized_y])
+                negative_points["labels"].append(0)
+                print(f"[SAM3 Point Collector]   Negative point: ({n['x']:.1f}, {n['y']:.1f}) -> ({normalized_x:.3f}, {normalized_y:.3f})")
+
+            print(f"[SAM3 Point Collector] Legacy output: {len(positive_points['points'])} positive, {len(negative_points['points'])} negative")
 
         # Cache the result
         result = (positive_points, negative_points)

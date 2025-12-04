@@ -287,28 +287,58 @@ class SAM3VideoSegmentation:
 
         elif prompt_mode == "point":
             # Point mode: combine positive and negative points
-            all_points = []
-            all_labels = []
+            # Check for multi-object format first
+            if positive_points and positive_points.get("objects"):
+                # MULTI-OBJECT MODE: Create separate VideoPrompts for each object
+                print(f"[SAM3 Video] Multi-object point mode detected")
+                for obj_data in positive_points["objects"]:
+                    obj_id = obj_data.get("obj_id", 1)
+                    pos_pts = obj_data.get("positive_points", [])
+                    neg_pts = obj_data.get("negative_points", [])
 
-            if positive_points and positive_points.get("points"):
-                for pt in positive_points["points"]:
-                    all_points.append([float(pt[0]), float(pt[1])])
-                    all_labels.append(1)  # Positive
+                    all_points = []
+                    all_labels = []
 
-            if negative_points and negative_points.get("points"):
-                for pt in negative_points["points"]:
-                    all_points.append([float(pt[0]), float(pt[1])])
-                    all_labels.append(0)  # Negative
+                    for pt in pos_pts:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(1)  # Positive
 
-            if all_points:
-                prompt = VideoPrompt.create_point(frame_idx, obj_id, all_points, all_labels)
-                video_state = video_state.with_prompt(prompt)
-                pos_count = len(positive_points.get("points", [])) if positive_points else 0
-                neg_count = len(negative_points.get("points", [])) if negative_points else 0
-                print(f"[SAM3 Video] Added point prompt: obj={obj_id}, "
-                      f"positive={pos_count}, negative={neg_count}")
+                    for pt in neg_pts:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(0)  # Negative
+
+                    if all_points:
+                        prompt = VideoPrompt.create_point(frame_idx, obj_id, all_points, all_labels)
+                        video_state = video_state.with_prompt(prompt)
+                        print(f"[SAM3 Video] Added point prompt: obj={obj_id}, "
+                              f"positive={len(pos_pts)}, negative={len(neg_pts)}")
+
+                if len(positive_points["objects"]) == 0:
+                    print("[SAM3 Video] Warning: point mode selected but no objects in multi-object data")
             else:
-                print("[SAM3 Video] Warning: point mode selected but no points provided")
+                # LEGACY SINGLE-OBJECT MODE: Original behavior
+                all_points = []
+                all_labels = []
+
+                if positive_points and positive_points.get("points"):
+                    for pt in positive_points["points"]:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(1)  # Positive
+
+                if negative_points and negative_points.get("points"):
+                    for pt in negative_points["points"]:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(0)  # Negative
+
+                if all_points:
+                    prompt = VideoPrompt.create_point(frame_idx, obj_id, all_points, all_labels)
+                    video_state = video_state.with_prompt(prompt)
+                    pos_count = len(positive_points.get("points", [])) if positive_points else 0
+                    neg_count = len(negative_points.get("points", [])) if negative_points else 0
+                    print(f"[SAM3 Video] Added point prompt: obj={obj_id}, "
+                          f"positive={pos_count}, negative={neg_count}")
+                else:
+                    print("[SAM3 Video] Warning: point mode selected but no points provided")
 
         elif prompt_mode == "box":
             # Box mode: add positive and/or negative boxes

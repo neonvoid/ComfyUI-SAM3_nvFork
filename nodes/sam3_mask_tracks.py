@@ -981,6 +981,12 @@ class SAM3VideoSegmenter:
             label_size=label_size
         )
 
+        # Squeeze single-object masks to [N, H, W] for ComfyUI compatibility
+        # (KJNodes and other preview nodes expect 3D masks)
+        if segment_masks.dim() == 4 and segment_masks.shape[1] == 1:
+            segment_masks = segment_masks.squeeze(1)
+            print(f"[SAM3 VideoSegmenter] Squeezed single-object mask to shape {segment_masks.shape}")
+
         # Build segment info
         segment_info = {
             "batch_index": batch_index,
@@ -992,7 +998,8 @@ class SAM3VideoSegmenter:
             "num_objects": len(valid_ids),
         }
 
-        print(f"[SAM3 VideoSegmenter] Output: {segment_frames.shape[0]} frames, {segment_masks.shape[1]} objects")
+        num_objs_out = segment_masks.shape[1] if segment_masks.dim() == 4 else 1
+        print(f"[SAM3 VideoSegmenter] Output: {segment_frames.shape[0]} frames, {num_objs_out} object(s), mask shape {segment_masks.shape}")
 
         return (
             segment_frames,

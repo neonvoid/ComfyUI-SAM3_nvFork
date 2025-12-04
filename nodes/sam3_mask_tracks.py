@@ -409,13 +409,222 @@ class SAM3SelectMask:
         return (selected, ids_str, visualization)
 
 
+class SAM3BatchPlanner:
+    """
+    Plan batch processing for multi-object tracking output.
+
+    Intelligently groups objects into batches for downstream workflows with
+    object count limits (e.g., 4-actor limit). Includes noise filtering for
+    robust handling of noisy footage.
+
+    Features:
+    - Filter out short-lived/noisy tracks by minimum visible frames
+    - Filter flickering objects by visibility ratio
+    - Sort by stability (visible_frames, avg_score, or first_frame)
+    - Output per-batch frame ranges for optional trimming
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "track_info": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "JSON track info from SAM3MaskTracks"
+                }),
+            },
+            "optional": {
+                "max_objects_per_batch": ("INT", {
+                    "default": 4,
+                    "min": 1,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": "Maximum number of objects per batch"
+                }),
+                "min_visible_frames": ("INT", {
+                    "default": 30,
+                    "min": 0,
+                    "max": 10000,
+                    "step": 1,
+                    "tooltip": "Filter out tracks with fewer visible frames (noise filter)"
+                }),
+                "min_visibility_ratio": ("FLOAT", {
+                    "default": 0.1,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Minimum ratio of visible_frames / total_span (filter flickering)"
+                }),
+                "sort_by": (["visible_frames", "avg_score", "first_frame"], {
+                    "default": "visible_frames",
+                    "tooltip": "Sort priority: most visible first, highest score first, or temporal order"
+                }),
+                "batch_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1000,
+                    "step": 1,
+                    "tooltip": "Which batch to output (0-indexed). Use with loops."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT", "INT", "STRING", "INT")
+    RETURN_NAMES = ("batch_object_ids", "batch_start_frame", "batch_end_frame", "num_batches", "batch_schedule", "filtered_count")
+    FUNCTION = "plan_batches"
+    CATEGORY = "SAM3/video"
+
+    def plan_batches(
+        self,
+        track_info,
+        max_objects_per_batch=4,
+        min_visible_frames=30,
+        min_visibility_ratio=0.1,
+        sort_by="visible_frames",
+        batch_index=0
+    ):
+        """
+        Parse track_info, filter noise, and generate batch schedule.
+        """
+        # Parse JSON
+        try:
+            info = json.loads(track_info)
+        except json.JSONDecodeError as e:
+            print(f"[SAM3 BatchPlanner] Error parsing track_info JSON: {e}")
+            return ("", 0, 0, 0, "{}", 0)
+
+        objects = info.get("objects", [])
+        total_frames = info.get("total_frames", 0)
+
+        print(f"[SAM3 BatchPlanner] Input: {len(objects)} objects, {total_frames} frames")
+
+        # Filter noise
+        filtered = []
+        filtered_out = []
+        for obj in objects:
+            first_frame = obj.get("first_frame")
+            last_frame = obj.get("last_frame")
+            visible_frames = obj.get("visible_frames", 0)
+
+            # Skip objects with no valid frame range
+            if first_frame is None or last_frame is None:
+                filtered_out.append(obj)
+                continue
+
+            # Calculate span and visibility ratio
+            span = last_frame - first_frame + 1
+            ratio = visible_frames / span if span > 0 else 0
+
+            # Apply filters
+            if visible_frames >= min_visible_frames and ratio >= min_visibility_ratio:
+                filtered.append(obj)
+            else:
+                filtered_out.append(obj)
+
+        filtered_count = len(filtered_out)
+        print(f"[SAM3 BatchPlanner] Filtered out {filtered_count} noisy tracks, {len(filtered)} remaining")
+
+        if filtered_out:
+            for obj in filtered_out:
+                print(f"[SAM3 BatchPlanner]   Filtered: Object {obj.get('id')} ({obj.get('visible_frames', 0)} visible frames)")
+
+        # Handle empty case
+        if not filtered:
+            print("[SAM3 BatchPlanner] Warning: No objects remaining after filtering")
+            empty_schedule = json.dumps({
+                "batches": [],
+                "total_batches": 0,
+                "filtered_count": filtered_count,
+                "settings": {
+                    "max_objects_per_batch": max_objects_per_batch,
+                    "min_visible_frames": min_visible_frames,
+                    "min_visibility_ratio": min_visibility_ratio,
+                    "sort_by": sort_by
+                }
+            }, indent=2)
+            return ("", 0, 0, 0, empty_schedule, filtered_count)
+
+        # Sort by stability
+        if sort_by == "visible_frames":
+            filtered.sort(key=lambda x: -x.get("visible_frames", 0))
+        elif sort_by == "avg_score":
+            filtered.sort(key=lambda x: -(x.get("avg_score") or 0))
+        elif sort_by == "first_frame":
+            filtered.sort(key=lambda x: x.get("first_frame", 0))
+
+        print(f"[SAM3 BatchPlanner] Sorted by {sort_by}")
+
+        # Group into batches
+        batches = []
+        for i in range(0, len(filtered), max_objects_per_batch):
+            batch_objs = filtered[i:i + max_objects_per_batch]
+            batch_ids = [obj["id"] for obj in batch_objs]
+            batch_start = min(obj["first_frame"] for obj in batch_objs)
+            batch_end = max(obj["last_frame"] for obj in batch_objs)
+
+            batches.append({
+                "batch_index": len(batches),
+                "object_ids": batch_ids,
+                "start_frame": batch_start,
+                "end_frame": batch_end,
+                "object_count": len(batch_ids)
+            })
+
+        num_batches = len(batches)
+
+        # Print batch summary
+        print(f"[SAM3 BatchPlanner] Created {num_batches} batches:")
+        for batch in batches:
+            ids_str = ",".join(str(i) for i in batch["object_ids"])
+            print(f"[SAM3 BatchPlanner]   Batch {batch['batch_index']}: Objects [{ids_str}], frames {batch['start_frame']}-{batch['end_frame']}")
+
+        # Build full schedule JSON
+        schedule = {
+            "batches": batches,
+            "total_batches": num_batches,
+            "filtered_count": filtered_count,
+            "settings": {
+                "max_objects_per_batch": max_objects_per_batch,
+                "min_visible_frames": min_visible_frames,
+                "min_visibility_ratio": min_visibility_ratio,
+                "sort_by": sort_by
+            }
+        }
+
+        # Get current batch info
+        if batch_index >= num_batches:
+            if num_batches > 0:
+                print(f"[SAM3 BatchPlanner] Warning: batch_index {batch_index} >= num_batches {num_batches}, using last batch")
+                batch_index = num_batches - 1
+            else:
+                return ("", 0, 0, 0, json.dumps(schedule, indent=2), filtered_count)
+
+        current_batch = batches[batch_index]
+        batch_object_ids = ",".join(str(i) for i in current_batch["object_ids"])
+        batch_start_frame = current_batch["start_frame"]
+        batch_end_frame = current_batch["end_frame"]
+
+        print(f"[SAM3 BatchPlanner] Output batch {batch_index}: objects=[{batch_object_ids}], frames={batch_start_frame}-{batch_end_frame}")
+
+        return (
+            batch_object_ids,
+            batch_start_frame,
+            batch_end_frame,
+            num_batches,
+            json.dumps(schedule, indent=2),
+            filtered_count
+        )
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "NV_SAM3MaskTracks": SAM3MaskTracks,
     "NV_SAM3SelectMask": SAM3SelectMask,
+    "NV_SAM3BatchPlanner": SAM3BatchPlanner,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_SAM3MaskTracks": "NV SAM3 Mask Tracks",
     "NV_SAM3SelectMask": "NV SAM3 Select Mask",
+    "NV_SAM3BatchPlanner": "NV SAM3 Batch Planner",
 }

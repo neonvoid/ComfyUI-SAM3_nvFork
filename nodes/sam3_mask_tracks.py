@@ -14,6 +14,7 @@ import json
 import torch
 import numpy as np
 from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 
 
 class SAM3MaskTracks:
@@ -434,6 +435,10 @@ class SAM3BatchPlanner:
                 }),
             },
             "optional": {
+                "batch_mode": (["by_stability", "temporal"], {
+                    "default": "by_stability",
+                    "tooltip": "by_stability: group by visibility/score. temporal: group by co-occurrence (who's on screen together)"
+                }),
                 "max_objects_per_batch": ("INT", {
                     "default": 4,
                     "min": 1,
@@ -457,7 +462,7 @@ class SAM3BatchPlanner:
                 }),
                 "sort_by": (["visible_frames", "avg_score", "first_frame"], {
                     "default": "visible_frames",
-                    "tooltip": "Sort priority: most visible first, highest score first, or temporal order"
+                    "tooltip": "Sort priority (by_stability mode): most visible first, highest score first, or temporal order"
                 }),
                 "batch_index": ("INT", {
                     "default": 0,
@@ -474,9 +479,100 @@ class SAM3BatchPlanner:
     FUNCTION = "plan_batches"
     CATEGORY = "SAM3/video"
 
+    def _temporal_batching(self, objects, max_per_batch, total_frames):
+        """
+        Group objects by temporal co-occurrence.
+
+        Creates batches where objects in each batch are visible together
+        in the same time window. Each batch has specific frame ranges.
+        """
+        if not objects or total_frames <= 0:
+            return []
+
+        # Build object lookup by ID
+        obj_by_id = {obj["id"]: obj for obj in objects}
+
+        # Build frame-to-objects mapping
+        frame_objects = defaultdict(set)
+        for obj in objects:
+            first_frame = obj["first_frame"]
+            last_frame = obj["last_frame"]
+            for f in range(first_frame, last_frame + 1):
+                frame_objects[f].add(obj["id"])
+
+        # Find transition points (where active object set changes)
+        transitions = [0]
+        prev_set = frame_objects.get(0, set())
+        for f in range(1, total_frames):
+            curr_set = frame_objects.get(f, set())
+            if curr_set != prev_set:
+                transitions.append(f)
+                prev_set = curr_set
+        transitions.append(total_frames)
+
+        # Create batches for each time window
+        batches = []
+        for i in range(len(transitions) - 1):
+            start_frame = transitions[i]
+            end_frame = transitions[i + 1] - 1
+
+            active_ids = list(frame_objects.get(start_frame, set()))
+            if not active_ids:
+                continue
+
+            # Sort active objects by their first_frame (entrance order)
+            active_ids.sort(key=lambda oid: obj_by_id[oid]["first_frame"])
+
+            # If more than max_per_batch objects, split into multiple batches
+            for j in range(0, len(active_ids), max_per_batch):
+                batch_ids = active_ids[j:j + max_per_batch]
+                batches.append({
+                    "batch_index": len(batches),
+                    "object_ids": batch_ids,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "object_count": len(batch_ids)
+                })
+
+        return batches
+
+    def _stability_batching(self, objects, max_per_batch, sort_by):
+        """
+        Group objects by stability (visibility/score), processing all their frames.
+
+        This is the original batching mode - groups objects regardless of
+        when they appear, sorted by stability metrics.
+        """
+        # Sort by stability
+        if sort_by == "visible_frames":
+            objects.sort(key=lambda x: -x.get("visible_frames", 0))
+        elif sort_by == "avg_score":
+            objects.sort(key=lambda x: -(x.get("avg_score") or 0))
+        elif sort_by == "first_frame":
+            objects.sort(key=lambda x: x.get("first_frame", 0))
+
+        # Group into batches
+        batches = []
+        for i in range(0, len(objects), max_per_batch):
+            batch_objs = objects[i:i + max_per_batch]
+            batch_ids = [obj["id"] for obj in batch_objs]
+            batch_start = min(obj["first_frame"] for obj in batch_objs)
+            batch_end = max(obj["last_frame"] for obj in batch_objs)
+
+            batches.append({
+                "batch_index": len(batches),
+                "object_ids": batch_ids,
+                "start_frame": batch_start,
+                "end_frame": batch_end,
+                "object_count": len(batch_ids)
+            })
+
+        return batches
+
     def plan_batches(
         self,
         track_info,
+        batch_mode="by_stability",
         max_objects_per_batch=4,
         min_visible_frames=30,
         min_visibility_ratio=0.1,
@@ -485,6 +581,10 @@ class SAM3BatchPlanner:
     ):
         """
         Parse track_info, filter noise, and generate batch schedule.
+
+        Two modes available:
+        - by_stability: Group by visibility/score, process all frames for each batch
+        - temporal: Group by co-occurrence, each batch processes only its time window
         """
         # Parse JSON
         try:
@@ -496,7 +596,7 @@ class SAM3BatchPlanner:
         objects = info.get("objects", [])
         total_frames = info.get("total_frames", 0)
 
-        print(f"[SAM3 BatchPlanner] Input: {len(objects)} objects, {total_frames} frames")
+        print(f"[SAM3 BatchPlanner] Input: {len(objects)} objects, {total_frames} frames, mode={batch_mode}")
 
         # Filter noise
         filtered = []
@@ -536,6 +636,7 @@ class SAM3BatchPlanner:
                 "total_batches": 0,
                 "filtered_count": filtered_count,
                 "settings": {
+                    "batch_mode": batch_mode,
                     "max_objects_per_batch": max_objects_per_batch,
                     "min_visible_frames": min_visible_frames,
                     "min_visibility_ratio": min_visibility_ratio,
@@ -544,31 +645,13 @@ class SAM3BatchPlanner:
             }, indent=2)
             return ("", 0, 0, 0, empty_schedule, filtered_count)
 
-        # Sort by stability
-        if sort_by == "visible_frames":
-            filtered.sort(key=lambda x: -x.get("visible_frames", 0))
-        elif sort_by == "avg_score":
-            filtered.sort(key=lambda x: -(x.get("avg_score") or 0))
-        elif sort_by == "first_frame":
-            filtered.sort(key=lambda x: x.get("first_frame", 0))
-
-        print(f"[SAM3 BatchPlanner] Sorted by {sort_by}")
-
-        # Group into batches
-        batches = []
-        for i in range(0, len(filtered), max_objects_per_batch):
-            batch_objs = filtered[i:i + max_objects_per_batch]
-            batch_ids = [obj["id"] for obj in batch_objs]
-            batch_start = min(obj["first_frame"] for obj in batch_objs)
-            batch_end = max(obj["last_frame"] for obj in batch_objs)
-
-            batches.append({
-                "batch_index": len(batches),
-                "object_ids": batch_ids,
-                "start_frame": batch_start,
-                "end_frame": batch_end,
-                "object_count": len(batch_ids)
-            })
+        # Generate batches based on mode
+        if batch_mode == "temporal":
+            print(f"[SAM3 BatchPlanner] Using temporal co-occurrence batching")
+            batches = self._temporal_batching(filtered, max_objects_per_batch, total_frames)
+        else:
+            print(f"[SAM3 BatchPlanner] Using stability batching, sorted by {sort_by}")
+            batches = self._stability_batching(filtered, max_objects_per_batch, sort_by)
 
         num_batches = len(batches)
 
@@ -584,6 +667,7 @@ class SAM3BatchPlanner:
             "total_batches": num_batches,
             "filtered_count": filtered_count,
             "settings": {
+                "batch_mode": batch_mode,
                 "max_objects_per_batch": max_objects_per_batch,
                 "min_visible_frames": min_visible_frames,
                 "min_visibility_ratio": min_visibility_ratio,

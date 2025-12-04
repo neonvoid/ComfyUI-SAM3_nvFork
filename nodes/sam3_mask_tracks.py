@@ -700,15 +700,225 @@ class SAM3BatchPlanner:
         )
 
 
+class SAM3VideoSegmenter:
+    """
+    Segment video and masks based on batch schedule.
+
+    Takes video frames, multi-object masks, and a batch schedule from BatchPlanner,
+    then outputs the actual segmented video/masks for a specific batch.
+
+    Key features:
+    - Extracts only the frame range for the batch
+    - Extracts only the object masks specified in the batch
+    - Provides visualization with colored mask overlays
+    - Outputs consistent mask channels (no jumping)
+    """
+
+    # Color palette for visualization (RGB, 0-1 range)
+    COLORS = [
+        [0.0, 0.5, 1.0],   # Blue
+        [1.0, 0.3, 0.3],   # Red
+        [0.3, 1.0, 0.3],   # Green
+        [1.0, 1.0, 0.0],   # Yellow
+        [1.0, 0.0, 1.0],   # Magenta
+        [0.0, 1.0, 1.0],   # Cyan
+        [1.0, 0.5, 0.0],   # Orange
+        [0.5, 0.0, 1.0],   # Purple
+    ]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_frames": ("IMAGE", {
+                    "tooltip": "Original video frames [N, H, W, C]"
+                }),
+                "all_masks": ("MASK", {
+                    "tooltip": "Multi-object masks from SAM3MaskTracks [N, num_objects, H, W]"
+                }),
+                "batch_schedule": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "JSON schedule from SAM3BatchPlanner"
+                }),
+            },
+            "optional": {
+                "batch_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1000,
+                    "step": 1,
+                    "tooltip": "Which batch to output (0-indexed)"
+                }),
+                "viz_alpha": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Mask overlay transparency for visualization"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "IMAGE", "STRING")
+    RETURN_NAMES = ("segment_frames", "segment_masks", "segment_combined_mask", "visualization", "segment_info")
+    FUNCTION = "segment_video"
+    CATEGORY = "SAM3/video"
+
+    def _create_visualization(self, frames, masks, alpha=0.5):
+        """Create colored mask overlay on video frames."""
+        num_frames = frames.shape[0]
+        h, w = frames.shape[1], frames.shape[2]
+        vis_list = []
+
+        for frame_idx in range(num_frames):
+            vis_frame = frames[frame_idx].clone()
+
+            if masks.dim() == 4:
+                # Multi-object masks [N_frames, N_objects, H, W]
+                num_objects = masks.shape[1]
+                for obj_idx in range(num_objects):
+                    obj_mask = masks[frame_idx, obj_idx].float()
+                    if obj_mask.max() > 1.0:
+                        obj_mask = obj_mask / 255.0
+
+                    color = torch.tensor(self.COLORS[obj_idx % len(self.COLORS)])
+                    mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
+                    vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
+
+            elif masks.dim() == 3:
+                # Single combined mask [N_frames, H, W]
+                obj_mask = masks[frame_idx].float()
+                if obj_mask.max() > 1.0:
+                    obj_mask = obj_mask / 255.0
+
+                color = torch.tensor(self.COLORS[0])
+                mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
+                vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
+
+            vis_list.append(vis_frame.clamp(0, 1))
+
+        return torch.stack(vis_list, dim=0)
+
+    def segment_video(
+        self,
+        video_frames,
+        all_masks,
+        batch_schedule,
+        batch_index=0,
+        viz_alpha=0.5
+    ):
+        """
+        Extract video segment and masks for a specific batch.
+        """
+        # Parse schedule JSON
+        try:
+            schedule = json.loads(batch_schedule)
+        except json.JSONDecodeError as e:
+            print(f"[SAM3 VideoSegmenter] Error parsing batch_schedule JSON: {e}")
+            empty_info = json.dumps({"error": str(e)})
+            return (video_frames[:1], all_masks[:1], all_masks[:1, 0] if all_masks.dim() == 4 else all_masks[:1], video_frames[:1], empty_info)
+
+        batches = schedule.get("batches", [])
+        if not batches:
+            print("[SAM3 VideoSegmenter] Warning: No batches in schedule")
+            empty_info = json.dumps({"error": "No batches in schedule"})
+            return (video_frames[:1], all_masks[:1], all_masks[:1, 0] if all_masks.dim() == 4 else all_masks[:1], video_frames[:1], empty_info)
+
+        # Clamp batch_index
+        if batch_index >= len(batches):
+            print(f"[SAM3 VideoSegmenter] Warning: batch_index {batch_index} >= num_batches {len(batches)}, using last batch")
+            batch_index = len(batches) - 1
+
+        batch = batches[batch_index]
+        start_frame = batch["start_frame"]
+        end_frame = batch["end_frame"]
+        object_ids = batch["object_ids"]
+
+        print(f"[SAM3 VideoSegmenter] Processing batch {batch_index}: objects={object_ids}, frames={start_frame}-{end_frame}")
+
+        # Validate frame range
+        num_frames = video_frames.shape[0]
+        start_frame = max(0, min(start_frame, num_frames - 1))
+        end_frame = max(start_frame, min(end_frame, num_frames - 1))
+
+        # Extract frame range
+        segment_frames = video_frames[start_frame:end_frame + 1]
+        print(f"[SAM3 VideoSegmenter] Extracted {segment_frames.shape[0]} frames")
+
+        # Extract masks for selected objects
+        if all_masks.dim() == 4:
+            # Multi-object masks [N_frames, N_objects, H, W]
+            num_objects = all_masks.shape[1]
+
+            # Validate object IDs
+            valid_ids = [oid for oid in object_ids if 0 <= oid < num_objects]
+            if not valid_ids:
+                print(f"[SAM3 VideoSegmenter] Warning: No valid object IDs, using object 0")
+                valid_ids = [0] if num_objects > 0 else []
+
+            if valid_ids:
+                # Extract frame range first, then select objects
+                frame_masks = all_masks[start_frame:end_frame + 1]
+                segment_masks = frame_masks[:, valid_ids, :, :]
+                print(f"[SAM3 VideoSegmenter] Extracted masks for {len(valid_ids)} objects: {valid_ids}")
+
+                # Create combined mask (union)
+                segment_combined = segment_masks.max(dim=1)[0]
+            else:
+                h, w = all_masks.shape[2], all_masks.shape[3]
+                segment_masks = torch.zeros(end_frame - start_frame + 1, 1, h, w)
+                segment_combined = torch.zeros(end_frame - start_frame + 1, h, w)
+
+        elif all_masks.dim() == 3:
+            # Single mask [N_frames, H, W] - just slice frames
+            segment_masks = all_masks[start_frame:end_frame + 1].unsqueeze(1)
+            segment_combined = all_masks[start_frame:end_frame + 1]
+            valid_ids = [0]
+            print(f"[SAM3 VideoSegmenter] Single mask input, extracted {segment_masks.shape[0]} frames")
+
+        else:
+            print(f"[SAM3 VideoSegmenter] Unexpected mask shape: {all_masks.shape}")
+            h, w = video_frames.shape[1], video_frames.shape[2]
+            segment_masks = torch.zeros(end_frame - start_frame + 1, 1, h, w)
+            segment_combined = torch.zeros(end_frame - start_frame + 1, h, w)
+            valid_ids = []
+
+        # Create visualization
+        visualization = self._create_visualization(segment_frames, segment_masks, viz_alpha)
+
+        # Build segment info
+        segment_info = {
+            "batch_index": batch_index,
+            "object_ids": valid_ids,
+            "original_object_ids": object_ids,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "num_frames": segment_frames.shape[0],
+            "num_objects": len(valid_ids),
+        }
+
+        print(f"[SAM3 VideoSegmenter] Output: {segment_frames.shape[0]} frames, {segment_masks.shape[1]} objects")
+
+        return (
+            segment_frames,
+            segment_masks,
+            segment_combined,
+            visualization,
+            json.dumps(segment_info, indent=2)
+        )
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "NV_SAM3MaskTracks": SAM3MaskTracks,
     "NV_SAM3SelectMask": SAM3SelectMask,
     "NV_SAM3BatchPlanner": SAM3BatchPlanner,
+    "NV_SAM3VideoSegmenter": SAM3VideoSegmenter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_SAM3MaskTracks": "NV SAM3 Mask Tracks",
     "NV_SAM3SelectMask": "NV SAM3 Select Mask",
     "NV_SAM3BatchPlanner": "NV SAM3 Batch Planner",
+    "NV_SAM3VideoSegmenter": "NV SAM3 Video Segmenter",
 }

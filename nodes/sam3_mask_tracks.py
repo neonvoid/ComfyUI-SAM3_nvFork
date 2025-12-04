@@ -768,6 +768,20 @@ class SAM3VideoSegmenter:
                     "step": 2,
                     "tooltip": "Font size for ID labels"
                 }),
+                "margin_head": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 300,
+                    "step": 1,
+                    "tooltip": "Extra frames to include before mask presence starts (smoother cuts)"
+                }),
+                "margin_tail": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 300,
+                    "step": 1,
+                    "tooltip": "Extra frames to include after mask presence ends (smoother cuts)"
+                }),
             }
         }
 
@@ -894,10 +908,15 @@ class SAM3VideoSegmenter:
         batch_index=0,
         viz_alpha=0.5,
         show_ids=True,
-        label_size=24
+        label_size=24,
+        margin_head=0,
+        margin_tail=0
     ):
         """
         Extract video segment and masks for a specific batch.
+
+        margin_head/margin_tail add extra frames before/after the batch's
+        frame range to create smoother cuts when video is trimmed.
         """
         # Parse schedule JSON
         try:
@@ -919,16 +938,19 @@ class SAM3VideoSegmenter:
             batch_index = len(batches) - 1
 
         batch = batches[batch_index]
-        start_frame = batch["start_frame"]
-        end_frame = batch["end_frame"]
+        batch_start = batch["start_frame"]
+        batch_end = batch["end_frame"]
         object_ids = batch["object_ids"]
 
-        print(f"[SAM3 VideoSegmenter] Processing batch {batch_index}: objects={object_ids}, frames={start_frame}-{end_frame}")
+        print(f"[SAM3 VideoSegmenter] Processing batch {batch_index}: objects={object_ids}, frames={batch_start}-{batch_end}")
 
-        # Validate frame range
+        # Apply head/tail margins and validate frame range
         num_frames = video_frames.shape[0]
-        start_frame = max(0, min(start_frame, num_frames - 1))
-        end_frame = max(start_frame, min(end_frame, num_frames - 1))
+        start_frame = max(0, batch_start - margin_head)
+        end_frame = min(num_frames - 1, batch_end + margin_tail)
+
+        if margin_head > 0 or margin_tail > 0:
+            print(f"[SAM3 VideoSegmenter] Applied margins: head={margin_head}, tail={margin_tail} -> frames={start_frame}-{end_frame}")
 
         # Extract frame range
         segment_frames = video_frames[start_frame:end_frame + 1]
@@ -992,8 +1014,12 @@ class SAM3VideoSegmenter:
             "batch_index": batch_index,
             "object_ids": valid_ids,
             "original_object_ids": object_ids,
+            "batch_start_frame": batch_start,
+            "batch_end_frame": batch_end,
             "start_frame": start_frame,
             "end_frame": end_frame,
+            "margin_head": margin_head,
+            "margin_tail": margin_tail,
             "num_frames": segment_frames.shape[0],
             "num_objects": len(valid_ids),
         }

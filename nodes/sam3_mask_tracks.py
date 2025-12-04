@@ -13,6 +13,7 @@ Key features:
 import json
 import torch
 import numpy as np
+import cv2
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
@@ -756,6 +757,17 @@ class SAM3VideoSegmenter:
                     "step": 0.05,
                     "tooltip": "Mask overlay transparency for visualization"
                 }),
+                "show_ids": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Overlay object ID labels on visualization to verify ID consistency"
+                }),
+                "label_size": ("INT", {
+                    "default": 24,
+                    "min": 8,
+                    "max": 72,
+                    "step": 2,
+                    "tooltip": "Font size for ID labels"
+                }),
             }
         }
 
@@ -764,8 +776,50 @@ class SAM3VideoSegmenter:
     FUNCTION = "segment_video"
     CATEGORY = "SAM3/video"
 
-    def _create_visualization(self, frames, masks, alpha=0.5):
-        """Create colored mask overlay on video frames."""
+    def _draw_text(self, frame_np, text, x, y, color, size=24):
+        """Draw text label with background on a numpy frame (H, W, C) uint8."""
+        font_scale = size / 30.0
+        thickness = max(1, int(size / 12))
+
+        # Get text size for centering and background
+        (text_w, text_h), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )
+
+        # Center text on position, clamp to frame bounds
+        x = max(0, min(int(x) - text_w // 2, frame_np.shape[1] - text_w - 4))
+        y = max(text_h + 4, min(int(y) + text_h // 2, frame_np.shape[0] - 4))
+
+        # Draw black background rectangle for readability
+        cv2.rectangle(
+            frame_np,
+            (x - 2, y - text_h - 2),
+            (x + text_w + 2, y + baseline + 2),
+            (0, 0, 0),
+            -1
+        )
+
+        # Draw text in the object's color
+        color_bgr = (int(color[2] * 255), int(color[1] * 255), int(color[0] * 255))
+        cv2.putText(
+            frame_np, text, (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale, color_bgr, thickness
+        )
+
+        return frame_np
+
+    def _create_visualization(self, frames, masks, object_ids=None, alpha=0.5, show_ids=True, label_size=24):
+        """
+        Create colored mask overlay on video frames with optional ID labels.
+
+        Args:
+            frames: Video frames [N, H, W, C]
+            masks: Masks [N, num_objects, H, W] or [N, H, W]
+            object_ids: List of actual object IDs (for labeling)
+            alpha: Mask overlay transparency
+            show_ids: Whether to draw ID labels at mask centroids
+            label_size: Font size for labels
+        """
         num_frames = frames.shape[0]
         h, w = frames.shape[1], frames.shape[2]
         vis_list = []
@@ -776,6 +830,8 @@ class SAM3VideoSegmenter:
             if masks.dim() == 4:
                 # Multi-object masks [N_frames, N_objects, H, W]
                 num_objects = masks.shape[1]
+
+                # First pass: draw mask overlays
                 for obj_idx in range(num_objects):
                     obj_mask = masks[frame_idx, obj_idx].float()
                     if obj_mask.max() > 1.0:
@@ -784,6 +840,36 @@ class SAM3VideoSegmenter:
                     color = torch.tensor(self.COLORS[obj_idx % len(self.COLORS)])
                     mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                     vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
+
+                vis_frame = vis_frame.clamp(0, 1)
+
+                # Second pass: draw ID labels (after all masks so labels are on top)
+                if show_ids and object_ids is not None:
+                    # Convert to numpy for cv2 text rendering
+                    frame_np = (vis_frame.cpu().numpy() * 255).astype(np.uint8)
+
+                    for obj_idx in range(num_objects):
+                        if obj_idx < len(object_ids):
+                            obj_id = object_ids[obj_idx]
+                            obj_mask = masks[frame_idx, obj_idx].float()
+                            if obj_mask.max() > 1.0:
+                                obj_mask = obj_mask / 255.0
+
+                            # Only draw label if mask has significant pixels
+                            if obj_mask.max() > 0.1:
+                                # Find mask centroid
+                                y_coords, x_coords = torch.where(obj_mask > 0.5)
+                                if len(y_coords) > 0:
+                                    cy = float(y_coords.float().mean())
+                                    cx = float(x_coords.float().mean())
+                                    color = self.COLORS[obj_idx % len(self.COLORS)]
+                                    frame_np = self._draw_text(
+                                        frame_np, f"ID:{obj_id}",
+                                        cx, cy, color, label_size
+                                    )
+
+                    # Convert back to tensor
+                    vis_frame = torch.from_numpy(frame_np.astype(np.float32) / 255.0)
 
             elif masks.dim() == 3:
                 # Single combined mask [N_frames, H, W]
@@ -794,8 +880,9 @@ class SAM3VideoSegmenter:
                 color = torch.tensor(self.COLORS[0])
                 mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                 vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
+                vis_frame = vis_frame.clamp(0, 1)
 
-            vis_list.append(vis_frame.clamp(0, 1))
+            vis_list.append(vis_frame)
 
         return torch.stack(vis_list, dim=0)
 
@@ -805,7 +892,9 @@ class SAM3VideoSegmenter:
         all_masks,
         batch_schedule,
         batch_index=0,
-        viz_alpha=0.5
+        viz_alpha=0.5,
+        show_ids=True,
+        label_size=24
     ):
         """
         Extract video segment and masks for a specific batch.
@@ -883,8 +972,14 @@ class SAM3VideoSegmenter:
             segment_combined = torch.zeros(end_frame - start_frame + 1, h, w)
             valid_ids = []
 
-        # Create visualization
-        visualization = self._create_visualization(segment_frames, segment_masks, viz_alpha)
+        # Create visualization with ID labels
+        visualization = self._create_visualization(
+            segment_frames, segment_masks,
+            object_ids=valid_ids,
+            alpha=viz_alpha,
+            show_ids=show_ids,
+            label_size=label_size
+        )
 
         # Build segment info
         segment_info = {

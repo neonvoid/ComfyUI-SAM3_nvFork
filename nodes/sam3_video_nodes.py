@@ -445,21 +445,30 @@ class SAM3Propagate:
                     "default": False,
                     "tooltip": "Only detect object entry/exit frames without storing all masks. Prevents OOM on long videos. Returns track_info with first_frame/last_frame per object."
                 }),
+                "stream_to_disk": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Write masks to disk during propagation instead of accumulating in memory. Enables processing of arbitrarily long videos. Use SAM3MaskLoader to read masks afterward."
+                }),
+                "mask_output_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Custom directory to save streamed masks (only used when stream_to_disk=True). Leave empty for auto temp dir. Masks are saved as {frame:05d}.npz"
+                }),
             }
         }
 
-    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SCORES", "SAM3_VIDEO_STATE", "STRING")
-    RETURN_NAMES = ("masks", "scores", "video_state", "track_info")
+    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SCORES", "SAM3_VIDEO_STATE", "STRING", "STRING")
+    RETURN_NAMES = ("masks", "scores", "video_state", "track_info", "mask_dir")
     FUNCTION = "propagate"
     CATEGORY = "SAM3/video"
 
     @classmethod
     def IS_CHANGED(cls, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
-                   offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False):
+                   offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False,
+                   stream_to_disk=False, mask_output_path=""):
         # Use object identity for caching - if upstream node is cached,
         # it returns the same object, so id() will match
         # This is more reliable than hashing content since video_state is immutable
-        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only)
+        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path)
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: video_state id={id(video_state)}, session={video_state.session_uuid if video_state else None}")
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: returning {result}")
         return result
@@ -950,11 +959,168 @@ class SAM3Propagate:
         track_info_json = json.dumps(track_info, indent=2)
         return masks_output, {}, track_info_json
 
+    def _propagate_streaming(self, sam3_model, video_state, start_frame, end_frame, direction, custom_mask_path=""):
+        """
+        Propagation that streams masks to disk as they're processed.
+
+        This mode writes each frame's mask to disk immediately, allowing processing
+        of arbitrarily long videos without running out of memory.
+
+        Args:
+            sam3_model: SAM3 model instance
+            video_state: Video state with prompts
+            start_frame: Start frame index
+            end_frame: End frame index
+            direction: Propagation direction
+            custom_mask_path: Optional custom directory for mask output
+
+        Returns:
+            Tuple of (empty_masks_dict, empty_scores_dict, track_info_json, mask_dir)
+        """
+        import os
+        import json
+
+        print(f"[SAM3 Video] STREAMING MODE: frames {start_frame} to {end_frame}")
+        print(f"[SAM3 Video] Prompts: {len(video_state.prompts)}")
+        print_vram("Before streaming propagation")
+
+        # Determine mask output directory
+        if custom_mask_path and custom_mask_path.strip():
+            mask_dir = custom_mask_path.strip()
+            print(f"[SAM3 Video] Using custom mask path: {mask_dir}")
+        else:
+            mask_dir = os.path.join(video_state.temp_dir, "masks")
+        os.makedirs(mask_dir, exist_ok=True)
+
+        # Track object presence (like range detection)
+        object_ranges = {}
+
+        # Build propagation request
+        request = {
+            "type": "propagate_in_video",
+            "session_id": video_state.session_uuid,
+            "propagation_direction": direction,
+            "start_frame_index": start_frame,
+            "max_frame_num_to_track": end_frame - start_frame + 1,
+        }
+
+        autocast_context = _get_autocast_context()
+        with autocast_context:
+            print_vram("Before reconstruction (streaming)")
+            inference_state = get_inference_state(sam3_model, video_state)
+            print_vram("After reconstruction")
+
+            try:
+                for response in sam3_model.handle_stream_request(request):
+                    frame_idx = response.get("frame_index", response.get("frame_idx"))
+                    if frame_idx is None:
+                        continue
+
+                    outputs = response.get("outputs", response)
+                    if outputs is None:
+                        continue
+
+                    # Extract mask
+                    mask = None
+                    for key in ["out_binary_masks", "video_res_masks", "masks"]:
+                        if key in outputs and outputs[key] is not None:
+                            mask = outputs[key]
+                            break
+
+                    if mask is None:
+                        continue
+
+                    # Move to CPU immediately
+                    if hasattr(mask, 'cpu'):
+                        mask = mask.cpu()
+                    elif isinstance(mask, np.ndarray):
+                        mask = torch.from_numpy(mask)
+
+                    # Handle dimensions
+                    if mask.dim() == 4:
+                        mask = mask.squeeze(0)  # Remove batch dim
+
+                    # Track object visibility (same as range detection)
+                    num_objects = mask.shape[0] if mask.dim() >= 3 else 1
+                    for obj_idx in range(num_objects):
+                        obj_id = obj_idx + 1
+                        obj_mask = mask[obj_idx] if mask.dim() == 3 else mask
+                        mask_area = obj_mask.sum().item()
+                        is_visible = mask_area > 100  # At least 100 pixels
+
+                        if is_visible:
+                            if obj_id not in object_ranges:
+                                object_ranges[obj_id] = {
+                                    "min_frame": frame_idx,
+                                    "max_frame": frame_idx,
+                                    "visible_count": 1
+                                }
+                            else:
+                                if frame_idx < object_ranges[obj_id]["min_frame"]:
+                                    object_ranges[obj_id]["min_frame"] = frame_idx
+                                if frame_idx > object_ranges[obj_id]["max_frame"]:
+                                    object_ranges[obj_id]["max_frame"] = frame_idx
+                                object_ranges[obj_id]["visible_count"] += 1
+
+                    # CRITICAL: Write mask to disk immediately
+                    mask_path = os.path.join(mask_dir, f"{frame_idx:05d}.npz")
+                    np.savez_compressed(mask_path, mask=mask.numpy())
+
+                    # Clear reference to allow GC
+                    del mask
+                    outputs.clear()
+
+                    # Periodic cleanup
+                    if frame_idx % 16 == 0:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                    # Progress logging
+                    if frame_idx % 50 == 0:
+                        print(f"[SAM3 Video] Streaming progress: frame {frame_idx}/{end_frame}")
+                        print_vram(f"Streaming frame {frame_idx}")
+
+            except Exception as e:
+                print(f"[SAM3 Video] Streaming error: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+
+        print_vram("After streaming loop")
+
+        # Build track_info (same structure as range detection)
+        track_info = {
+            "objects": [
+                {
+                    "id": obj_id,
+                    "first_frame": ranges["min_frame"],
+                    "last_frame": ranges["max_frame"],
+                    "visible_frames": ranges["visible_count"]
+                }
+                for obj_id, ranges in sorted(object_ranges.items())
+            ],
+            "total_frames": end_frame - start_frame + 1,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "mode": "streaming",
+            "mask_dir": mask_dir
+        }
+
+        # Count files written
+        mask_files = [f for f in os.listdir(mask_dir) if f.endswith('.npz')]
+        print(f"[SAM3 Video] Streaming complete: {len(mask_files)} masks written to {mask_dir}")
+        for obj_id, ranges in sorted(object_ranges.items()):
+            print(f"[SAM3 Video]   Object {obj_id}: frames {ranges['min_frame']}-{ranges['max_frame']} ({ranges['visible_count']} visible)")
+
+        return {}, {}, json.dumps(track_info, indent=2), mask_dir
+
     def propagate(self, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
-                  offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False):
+                  offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False,
+                  stream_to_disk=False, mask_output_path=""):
         """Run propagation using reconstructed inference state."""
         # Create cache key using video_state object id (since it's immutable and cached upstream)
-        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only)
+        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path)
 
         # Check if we have cached result
         if cache_key in SAM3Propagate._cache:
@@ -985,11 +1151,17 @@ class SAM3Propagate:
         actual_end_frame = end_frame if end_frame >= 0 else video_state.num_frames - 1
         total_frames = actual_end_frame - start_frame + 1
 
-        # Initialize track_info (will be populated in range detection mode)
+        # Initialize track_info and mask_dir (will be populated in range detection/streaming modes)
         track_info_json = ""
+        mask_dir = ""
 
         # Branch based on mode
-        if range_detection_only:
+        if stream_to_disk:
+            # Streaming mode - write masks to disk as they're processed
+            masks_dict, scores_dict, track_info_json, mask_dir = self._propagate_streaming(
+                sam3_model, video_state, start_frame, actual_end_frame, direction, mask_output_path
+            )
+        elif range_detection_only:
             # Lightweight mode - only track object presence
             masks_dict, scores_dict, track_info_json = self._propagate_range_detection(
                 sam3_model, video_state, start_frame, actual_end_frame, direction
@@ -1098,7 +1270,7 @@ class SAM3Propagate:
             print_vram("After model offload")
 
         # Cache the result
-        result = (masks_dict, scores_dict, video_state, track_info_json)
+        result = (masks_dict, scores_dict, video_state, track_info_json, mask_dir)
         SAM3Propagate._cache[cache_key] = result
 
         return result
@@ -1386,6 +1558,421 @@ class SAM3VideoOutput:
 
 
 # =============================================================================
+# Mask Loading (for streaming mode)
+# =============================================================================
+
+class SAM3MaskLoader:
+    """
+    Load masks from disk that were saved by streaming propagation.
+
+    Use this node after SAM3Propagate with stream_to_disk=True to load
+    masks for specific frame ranges. This allows processing very long videos
+    by loading only the frames you need at a time.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask_dir": ("STRING", {
+                    "default": "",
+                    "tooltip": "Path to mask directory from SAM3Propagate (stream_to_disk mode)"
+                }),
+            },
+            "optional": {
+                "start_frame": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "tooltip": "First frame to load (0 for beginning)"
+                }),
+                "end_frame": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "tooltip": "Last frame to load (-1 for all remaining)"
+                }),
+                "obj_id": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "tooltip": "Specific object ID to load (-1 for all objects)"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "STRING")
+    RETURN_NAMES = ("masks", "info")
+    FUNCTION = "load_masks"
+    CATEGORY = "SAM3/video"
+
+    def load_masks(self, mask_dir, start_frame=0, end_frame=-1, obj_id=-1):
+        """Load masks from disk into memory."""
+        import os
+        import glob
+        import json
+
+        if not mask_dir or not os.path.isdir(mask_dir):
+            print(f"[SAM3 MaskLoader] Error: Invalid mask_dir: {mask_dir}")
+            return ({}, json.dumps({"error": f"Invalid mask_dir: {mask_dir}"}))
+
+        # Find all mask files
+        mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.npz")))
+
+        if not mask_files:
+            print(f"[SAM3 MaskLoader] Error: No .npz files found in {mask_dir}")
+            return ({}, json.dumps({"error": "No mask files found"}))
+
+        # Determine frame range from files
+        all_frames = [int(os.path.basename(f).replace(".npz", "")) for f in mask_files]
+        min_frame = min(all_frames)
+        max_frame = max(all_frames)
+
+        actual_start = start_frame if start_frame >= 0 else min_frame
+        actual_end = end_frame if end_frame >= 0 else max_frame
+
+        print(f"[SAM3 MaskLoader] Loading masks from {mask_dir}")
+        print(f"[SAM3 MaskLoader] Frame range: {actual_start} to {actual_end} (available: {min_frame}-{max_frame})")
+        if obj_id >= 0:
+            print(f"[SAM3 MaskLoader] Filtering to object ID: {obj_id}")
+
+        # Load masks
+        masks_dict = {}
+        loaded_count = 0
+        skipped_count = 0
+
+        for mask_file in mask_files:
+            frame_idx = int(os.path.basename(mask_file).replace(".npz", ""))
+
+            # Check if frame is in requested range
+            if actual_start <= frame_idx <= actual_end:
+                try:
+                    data = np.load(mask_file)
+                    mask = torch.from_numpy(data["mask"])
+
+                    # Handle obj_id selection
+                    if obj_id >= 0 and mask.dim() >= 3:
+                        if obj_id < mask.shape[0]:
+                            # Extract single object mask, keep dimension
+                            mask = mask[obj_id:obj_id+1]
+                        else:
+                            # Object ID doesn't exist in this frame
+                            skipped_count += 1
+                            continue
+
+                    masks_dict[frame_idx] = mask
+                    loaded_count += 1
+
+                except Exception as e:
+                    print(f"[SAM3 MaskLoader] Warning: Failed to load {mask_file}: {e}")
+                    skipped_count += 1
+
+        print(f"[SAM3 MaskLoader] Loaded {loaded_count} masks, skipped {skipped_count}")
+
+        info = {
+            "loaded_frames": loaded_count,
+            "skipped_frames": skipped_count,
+            "frame_range": [actual_start, actual_end],
+            "available_range": [min_frame, max_frame],
+            "obj_id_filter": obj_id,
+            "mask_dir": mask_dir
+        }
+
+        return (masks_dict, json.dumps(info, indent=2))
+
+
+# =============================================================================
+# Mask to Video Combiner (for streaming mode)
+# =============================================================================
+
+class SAM3MaskToVideo:
+    """
+    Combine streamed masks back into a visualization video.
+
+    Processes masks one frame at a time from disk to avoid OOM.
+    Use this node after SAM3Propagate with stream_to_disk=True to create
+    colored overlay visualizations with optional ID labels.
+    """
+
+    # Color palette (matching SAM3VideoSegmenter)
+    COLORS = [
+        [0.0, 0.5, 1.0],   # Blue
+        [1.0, 0.3, 0.3],   # Red
+        [0.3, 1.0, 0.3],   # Green
+        [1.0, 1.0, 0.0],   # Yellow
+        [1.0, 0.0, 1.0],   # Magenta
+        [0.0, 1.0, 1.0],   # Cyan
+        [1.0, 0.5, 0.0],   # Orange
+        [0.5, 0.0, 1.0],   # Purple
+    ]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_frames": ("IMAGE", {
+                    "tooltip": "Original video frames [N, H, W, C]"
+                }),
+                "mask_dir": ("STRING", {
+                    "default": "",
+                    "tooltip": "Path to mask directory from SAM3Propagate (stream_to_disk mode)"
+                }),
+            },
+            "optional": {
+                "start_frame": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "tooltip": "First frame to process"
+                }),
+                "end_frame": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "tooltip": "Last frame to process (-1 for all)"
+                }),
+                "obj_id": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "tooltip": "Specific object to visualize (-1 for all)"
+                }),
+                "viz_alpha": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Mask overlay transparency"
+                }),
+                "show_ids": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Show object ID labels at mask centroids"
+                }),
+                "label_size": ("INT", {
+                    "default": 24,
+                    "min": 8,
+                    "max": 72,
+                    "tooltip": "Font size for ID labels"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("visualization", "combined_masks", "info")
+    FUNCTION = "combine_video"
+    CATEGORY = "SAM3/video"
+
+    def _draw_id_label(self, frame_np, text, x, y, color, size=24):
+        """Draw ID label on frame using OpenCV."""
+        try:
+            import cv2
+        except ImportError:
+            # OpenCV not available, skip drawing
+            return frame_np
+
+        # Calculate font parameters
+        font_scale = size / 30.0
+        thickness = max(1, int(size / 12))
+
+        # Get text size
+        (text_w, text_h), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )
+
+        # Center text on position
+        text_x = max(0, min(x - text_w // 2, frame_np.shape[1] - text_w))
+        text_y = max(text_h, min(y + text_h // 2, frame_np.shape[0]))
+
+        # Draw background rectangle for readability
+        cv2.rectangle(
+            frame_np,
+            (text_x - 2, text_y - text_h - 2),
+            (text_x + text_w + 2, text_y + baseline + 2),
+            (0, 0, 0),
+            -1
+        )
+
+        # Draw text
+        color_255 = tuple(int(c * 255) for c in color)
+        cv2.putText(
+            frame_np, text, (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale, color_255, thickness
+        )
+
+        return frame_np
+
+    def _visualize_frame(self, frame, mask, alpha, show_ids, label_size):
+        """Create colored overlay for a single frame with optional ID labels."""
+        vis_frame = frame.clone()
+        id_positions = []  # Collect positions for ID labels
+
+        if mask.dim() == 3:
+            # Multi-object mask [num_objects, H, W]
+            for obj_idx in range(mask.shape[0]):
+                obj_mask = mask[obj_idx].float()
+                if obj_mask.max() > 1.0:
+                    obj_mask = obj_mask / 255.0
+
+                color = torch.tensor(self.COLORS[obj_idx % len(self.COLORS)])
+                mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
+                vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
+
+                # Find centroid for ID label
+                if show_ids and obj_mask.sum() > 100:
+                    y_coords, x_coords = torch.where(obj_mask > 0.5)
+                    if len(y_coords) > 0:
+                        cy = int(y_coords.float().mean())
+                        cx = int(x_coords.float().mean())
+                        id_positions.append((obj_idx + 1, cx, cy, self.COLORS[obj_idx % len(self.COLORS)]))
+        else:
+            # Single mask [H, W]
+            obj_mask = mask.float()
+            if obj_mask.max() > 1.0:
+                obj_mask = obj_mask / 255.0
+            color = torch.tensor(self.COLORS[0])
+            mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
+            vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
+
+            # Find centroid for ID label
+            if show_ids and obj_mask.sum() > 100:
+                y_coords, x_coords = torch.where(obj_mask > 0.5)
+                if len(y_coords) > 0:
+                    cy = int(y_coords.float().mean())
+                    cx = int(x_coords.float().mean())
+                    id_positions.append((1, cx, cy, self.COLORS[0]))
+
+        vis_frame = vis_frame.clamp(0, 1)
+
+        # Draw ID labels using OpenCV
+        if show_ids and id_positions:
+            # Convert to numpy for OpenCV
+            frame_np = (vis_frame.cpu().numpy() * 255).astype(np.uint8)
+
+            for obj_id, cx, cy, color in id_positions:
+                frame_np = self._draw_id_label(
+                    frame_np, f"ID:{obj_id}", cx, cy, color, label_size
+                )
+
+            vis_frame = torch.from_numpy(frame_np.astype(np.float32) / 255.0)
+
+        return vis_frame
+
+    def combine_video(self, video_frames, mask_dir, start_frame=0, end_frame=-1,
+                      obj_id=-1, viz_alpha=0.5, show_ids=True, label_size=24):
+        """
+        Stream masks from disk and create visualization incrementally.
+        """
+        import os
+        import glob
+        import json
+
+        if not mask_dir or not os.path.isdir(mask_dir):
+            print(f"[SAM3 MaskToVideo] Error: Invalid mask_dir: {mask_dir}")
+            return (
+                video_frames,
+                torch.zeros(video_frames.shape[0], video_frames.shape[1], video_frames.shape[2]),
+                json.dumps({"error": f"Invalid mask_dir: {mask_dir}"})
+            )
+
+        # Find mask files
+        mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.npz")))
+        if not mask_files:
+            print(f"[SAM3 MaskToVideo] Error: No .npz files found in {mask_dir}")
+            return (
+                video_frames,
+                torch.zeros(video_frames.shape[0], video_frames.shape[1], video_frames.shape[2]),
+                json.dumps({"error": "No mask files found"})
+            )
+
+        # Determine frame range from mask files
+        all_frame_indices = [int(os.path.basename(f).replace(".npz", "")) for f in mask_files]
+        min_mask_frame = min(all_frame_indices)
+        max_mask_frame = max(all_frame_indices)
+
+        # Determine processing range
+        num_video_frames = video_frames.shape[0]
+        actual_start = max(0, start_frame)
+        actual_end = min(num_video_frames - 1, end_frame if end_frame >= 0 else num_video_frames - 1)
+
+        print(f"[SAM3 MaskToVideo] Processing frames {actual_start} to {actual_end}")
+        print(f"[SAM3 MaskToVideo] Mask files available: {min_mask_frame} to {max_mask_frame}")
+        if obj_id >= 0:
+            print(f"[SAM3 MaskToVideo] Filtering to object ID: {obj_id}")
+        print_vram("Before MaskToVideo")
+
+        vis_list = []
+        mask_list = []
+
+        # Process one frame at a time (memory efficient)
+        for frame_idx in range(actual_start, actual_end + 1):
+            frame = video_frames[frame_idx]
+            h, w = frame.shape[:2]
+
+            # Load mask for this frame if it exists
+            mask_path = os.path.join(mask_dir, f"{frame_idx:05d}.npz")
+
+            if os.path.exists(mask_path):
+                try:
+                    data = np.load(mask_path)
+                    mask = torch.from_numpy(data["mask"])
+
+                    # Handle dimensions
+                    if mask.dim() == 4:
+                        mask = mask.squeeze(0)  # Remove batch dim
+
+                    # Filter by obj_id if specified
+                    if obj_id >= 0 and mask.dim() == 3:
+                        if obj_id < mask.shape[0]:
+                            mask = mask[obj_id:obj_id+1]
+                        else:
+                            mask = torch.zeros(1, h, w)
+
+                    # Create visualization for this frame
+                    vis_frame = self._visualize_frame(frame, mask, viz_alpha, show_ids, label_size)
+
+                    # Create combined mask
+                    if mask.dim() == 3:
+                        combined = mask.max(dim=0)[0]
+                    else:
+                        combined = mask
+
+                    # Ensure mask is 2D
+                    if combined.dim() > 2:
+                        combined = combined.squeeze()
+                    if combined.dim() == 0:
+                        combined = combined.unsqueeze(0).unsqueeze(0).expand(h, w)
+
+                except Exception as e:
+                    print(f"[SAM3 MaskToVideo] Warning: Failed to load {mask_path}: {e}")
+                    vis_frame = frame.clone()
+                    combined = torch.zeros(h, w)
+            else:
+                # No mask for this frame
+                vis_frame = frame.clone()
+                combined = torch.zeros(h, w)
+
+            vis_list.append(vis_frame)
+            mask_list.append(combined)
+
+            # Periodic cleanup and progress
+            if frame_idx % 50 == 0:
+                gc.collect()
+                print(f"[SAM3 MaskToVideo] Progress: frame {frame_idx}/{actual_end}")
+
+        visualization = torch.stack(vis_list, dim=0)
+        combined_masks = torch.stack(mask_list, dim=0)
+
+        print(f"[SAM3 MaskToVideo] Complete: {len(vis_list)} frames processed")
+        print_vram("After MaskToVideo")
+
+        info = {
+            "processed_frames": len(vis_list),
+            "frame_range": [actual_start, actual_end],
+            "mask_range": [min_mask_frame, max_mask_frame],
+            "obj_id_filter": obj_id,
+            "mask_dir": mask_dir,
+            "show_ids": show_ids,
+            "viz_alpha": viz_alpha
+        }
+
+        return (visualization, combined_masks, json.dumps(info, indent=2))
+
+
+# =============================================================================
 # Node Mappings
 # =============================================================================
 
@@ -1393,10 +1980,14 @@ NODE_CLASS_MAPPINGS = {
     "SAM3VideoSegmentation": SAM3VideoSegmentation,
     "SAM3Propagate": SAM3Propagate,
     "SAM3VideoOutput": SAM3VideoOutput,
+    "SAM3MaskLoader": SAM3MaskLoader,
+    "SAM3MaskToVideo": SAM3MaskToVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3VideoSegmentation": "SAM3 Video Segmentation",
     "SAM3Propagate": "SAM3 Propagate",
     "SAM3VideoOutput": "SAM3 Video Output",
+    "SAM3MaskLoader": "SAM3 Mask Loader",
+    "SAM3MaskToVideo": "SAM3 Mask to Video",
 }

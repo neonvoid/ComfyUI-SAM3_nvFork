@@ -441,21 +441,25 @@ class SAM3Propagate:
                     "step": 50,
                     "tooltip": "Number of frames per chunk. Lower values use less VRAM. 250 is good for ~8GB VRAM."
                 }),
+                "range_detection_only": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Only detect object entry/exit frames without storing all masks. Prevents OOM on long videos. Returns track_info with first_frame/last_frame per object."
+                }),
             }
         }
 
-    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SCORES", "SAM3_VIDEO_STATE")
-    RETURN_NAMES = ("masks", "scores", "video_state")
+    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SCORES", "SAM3_VIDEO_STATE", "STRING")
+    RETURN_NAMES = ("masks", "scores", "video_state", "track_info")
     FUNCTION = "propagate"
     CATEGORY = "SAM3/video"
 
     @classmethod
     def IS_CHANGED(cls, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
-                   offload_model=False, enable_chunking=False, chunk_size=250):
+                   offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False):
         # Use object identity for caching - if upstream node is cached,
         # it returns the same object, so id() will match
         # This is more reliable than hashing content since video_state is immutable
-        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size)
+        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only)
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: video_state id={id(video_state)}, session={video_state.session_uuid if video_state else None}")
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: returning {result}")
         return result
@@ -747,11 +751,202 @@ class SAM3Propagate:
         print(f"[SAM3 Chunked] All chunks complete: {len(all_masks)} total frames")
         return all_masks, all_scores
 
+    def _propagate_range_detection(self, sam3_model, video_state, start_frame, end_frame, direction):
+        """
+        Lightweight propagation that only tracks object presence (first/last visible frame).
+
+        This mode prevents OOM on long videos by not accumulating all masks in memory.
+        Instead, it only tracks when each object enters and exits the video.
+
+        Args:
+            sam3_model: SAM3 model instance
+            video_state: Video state with prompts
+            start_frame: Start frame index
+            end_frame: End frame index
+            direction: Propagation direction
+
+        Returns:
+            Tuple of (boundary_masks_dict, scores_dict, track_info_json)
+        """
+        import json
+
+        print(f"[SAM3 Video] RANGE DETECTION MODE: frames {start_frame} to {end_frame}")
+        print(f"[SAM3 Video] Prompts: {len(video_state.prompts)}")
+        print_vram("Before range detection")
+
+        # Track object presence: {obj_id: {"first": frame, "last": frame, "visible_count": int}}
+        object_ranges = {}
+        # Store boundary masks: {obj_id: {"first_mask": tensor, "last_mask": tensor, "first_frame": int, "last_frame": int}}
+        boundary_masks = {}
+
+        # Build propagation request
+        request = {
+            "type": "propagate_in_video",
+            "session_id": video_state.session_uuid,
+            "propagation_direction": direction,
+            "start_frame_index": start_frame,
+            "max_frame_num_to_track": end_frame - start_frame + 1,
+        }
+
+        autocast_context = _get_autocast_context()
+        with autocast_context:
+            print_vram("Before reconstruction (range detection)")
+            inference_state = get_inference_state(sam3_model, video_state)
+            print_vram("After reconstruction")
+
+            try:
+                for response in sam3_model.handle_stream_request(request):
+                    frame_idx = response.get("frame_index", response.get("frame_idx"))
+                    if frame_idx is None:
+                        continue
+
+                    outputs = response.get("outputs", response)
+                    if outputs is None:
+                        continue
+
+                    # Try different possible mask keys
+                    mask = None
+                    for key in ["out_binary_masks", "video_res_masks", "masks"]:
+                        if key in outputs and outputs[key] is not None:
+                            mask = outputs[key]
+                            break
+
+                    if mask is None:
+                        continue
+
+                    # Move to CPU immediately to avoid GPU accumulation
+                    if hasattr(mask, 'cpu'):
+                        mask = mask.cpu()
+                    elif isinstance(mask, np.ndarray):
+                        mask = torch.from_numpy(mask)
+
+                    # Determine mask shape and iterate over objects
+                    # mask shape is typically [num_objects, H, W] or [1, num_objects, H, W]
+                    if mask.dim() == 4:
+                        mask = mask.squeeze(0)  # Remove batch dimension
+
+                    num_objects = mask.shape[0] if mask.dim() >= 3 else 1
+
+                    for obj_idx in range(num_objects):
+                        obj_id = obj_idx + 1  # SAM3 uses 1-indexed obj_ids
+
+                        if mask.dim() == 3:
+                            obj_mask = mask[obj_idx]
+                        else:
+                            obj_mask = mask
+
+                        # Check if object is visible (mask has significant area)
+                        # Use sum > threshold instead of max to avoid noise
+                        mask_area = obj_mask.sum().item()
+                        is_visible = mask_area > 100  # At least 100 pixels
+
+                        if is_visible:
+                            if obj_id not in object_ranges:
+                                # First time seeing this object
+                                object_ranges[obj_id] = {
+                                    "first": frame_idx,
+                                    "last": frame_idx,
+                                    "visible_count": 1
+                                }
+                                boundary_masks[obj_id] = {
+                                    "first_mask": obj_mask.clone(),
+                                    "first_frame": frame_idx,
+                                    "last_mask": obj_mask.clone(),
+                                    "last_frame": frame_idx
+                                }
+                            else:
+                                # Update last seen frame
+                                object_ranges[obj_id]["last"] = frame_idx
+                                object_ranges[obj_id]["visible_count"] += 1
+                                boundary_masks[obj_id]["last_mask"] = obj_mask.clone()
+                                boundary_masks[obj_id]["last_frame"] = frame_idx
+
+                    # Clear the mask tensor to free memory
+                    del mask
+                    outputs.clear()
+
+                    # Periodic cleanup - more aggressive in range detection mode
+                    if frame_idx % 16 == 0:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                    # Progress logging
+                    if frame_idx % 50 == 0:
+                        print(f"[SAM3 Video] Range detection progress: frame {frame_idx}/{end_frame}")
+
+            except Exception as e:
+                print(f"[SAM3 Video] Range detection error: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+
+        print_vram("After range detection loop")
+
+        # Build track_info JSON
+        track_info = {
+            "objects": [
+                {
+                    "id": obj_id,
+                    "first_frame": ranges["first"],
+                    "last_frame": ranges["last"],
+                    "visible_frames": ranges["visible_count"]
+                }
+                for obj_id, ranges in sorted(object_ranges.items())
+            ],
+            "total_frames": end_frame - start_frame + 1,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "mode": "range_detection"
+        }
+
+        # Log results
+        print(f"[SAM3 Video] Range detection complete: {len(object_ranges)} objects tracked")
+        for obj_id, ranges in sorted(object_ranges.items()):
+            print(f"[SAM3 Video]   Object {obj_id}: frames {ranges['first']}-{ranges['last']} ({ranges['visible_count']} visible)")
+
+        # Build boundary masks output
+        # Structure: {frame_idx: mask_tensor} containing only boundary frames
+        # For each object, include first and last visible frame masks
+        boundary_masks_dict = {}
+        for obj_id, masks_data in boundary_masks.items():
+            first_frame = masks_data["first_frame"]
+            last_frame = masks_data["last_frame"]
+
+            # Initialize frame entries if not present
+            if first_frame not in boundary_masks_dict:
+                boundary_masks_dict[first_frame] = {}
+            if last_frame not in boundary_masks_dict:
+                boundary_masks_dict[last_frame] = {}
+
+            # Store masks indexed by obj_id
+            boundary_masks_dict[first_frame][obj_id] = masks_data["first_mask"]
+            boundary_masks_dict[last_frame][obj_id] = masks_data["last_mask"]
+
+        # Convert to standard format: {frame_idx: stacked_masks_tensor}
+        masks_output = {}
+        for frame_idx, obj_masks in boundary_masks_dict.items():
+            if obj_masks:
+                # Stack all object masks for this frame
+                max_obj_id = max(obj_masks.keys())
+                stacked = []
+                for oid in range(1, max_obj_id + 1):
+                    if oid in obj_masks:
+                        stacked.append(obj_masks[oid])
+                    else:
+                        # Placeholder empty mask
+                        sample_mask = next(iter(obj_masks.values()))
+                        stacked.append(torch.zeros_like(sample_mask))
+                masks_output[frame_idx] = torch.stack(stacked, dim=0)
+
+        track_info_json = json.dumps(track_info, indent=2)
+        return masks_output, {}, track_info_json
+
     def propagate(self, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
-                  offload_model=False, enable_chunking=False, chunk_size=250):
+                  offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False):
         """Run propagation using reconstructed inference state."""
         # Create cache key using video_state object id (since it's immutable and cached upstream)
-        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size)
+        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only)
 
         # Check if we have cached result
         if cache_key in SAM3Propagate._cache:
@@ -782,8 +977,16 @@ class SAM3Propagate:
         actual_end_frame = end_frame if end_frame >= 0 else video_state.num_frames - 1
         total_frames = actual_end_frame - start_frame + 1
 
-        # Branch based on chunking mode
-        if enable_chunking and total_frames > chunk_size:
+        # Initialize track_info (will be populated in range detection mode)
+        track_info_json = ""
+
+        # Branch based on mode
+        if range_detection_only:
+            # Lightweight mode - only track object presence
+            masks_dict, scores_dict, track_info_json = self._propagate_range_detection(
+                sam3_model, video_state, start_frame, actual_end_frame, direction
+            )
+        elif enable_chunking and total_frames > chunk_size:
             print(f"[SAM3 Video] CHUNKED MODE: {total_frames} frames, chunk_size={chunk_size}")
             masks_dict, scores_dict = self._propagate_with_chunking(
                 sam3_model, video_state, start_frame, actual_end_frame, direction, chunk_size
@@ -887,7 +1090,7 @@ class SAM3Propagate:
             print_vram("After model offload")
 
         # Cache the result
-        result = (masks_dict, scores_dict, video_state)
+        result = (masks_dict, scores_dict, video_state, track_info_json)
         SAM3Propagate._cache[cache_key] = result
 
         return result

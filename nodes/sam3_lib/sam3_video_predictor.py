@@ -196,6 +196,60 @@ class Sam3VideoPredictor:
         )
         return {"frame_index": frame_idx, "outputs": outputs}
 
+    def add_new_mask(
+        self,
+        session_id: str,
+        frame_idx: int,
+        obj_id: int,
+        mask,
+    ):
+        """
+        Add a mask prompt on a specific video frame.
+
+        Used for mask-guided chunk continuation in chunked video processing.
+
+        Args:
+            session_id: Session identifier
+            frame_idx: Frame index to apply the mask (usually 0 for chunk init)
+            obj_id: Object ID for tracking
+            mask: 2D tensor [H, W] with mask values (0-1 or boolean)
+
+        Returns:
+            Dict with frame_index and outputs
+        """
+        import torch
+        logger.debug(
+            f"add mask prompt on frame {frame_idx} in session {session_id}: "
+            f"obj_id={obj_id}, mask_shape={mask.shape if hasattr(mask, 'shape') else 'N/A'}"
+        )
+        session = self._get_session(session_id)
+        inference_state = session["state"]
+
+        # Ensure mask is a 2D tensor
+        if isinstance(mask, torch.Tensor):
+            mask_tensor = mask
+        else:
+            import numpy as np
+            mask_tensor = torch.from_numpy(np.array(mask))
+
+        if mask_tensor.dim() > 2:
+            mask_tensor = mask_tensor.squeeze()
+        assert mask_tensor.dim() == 2, f"Mask must be 2D, got {mask_tensor.dim()}D"
+
+        # Call the model's add_new_mask method
+        frame_idx, obj_ids, low_res_masks, video_res_masks = self.model.add_new_mask(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            mask=mask_tensor,
+        )
+
+        outputs = {
+            "obj_ids": obj_ids,
+            "video_res_masks": video_res_masks,
+        }
+        return {"frame_index": frame_idx, "outputs": outputs}
+
     def remove_object(
         self,
         session_id: str,

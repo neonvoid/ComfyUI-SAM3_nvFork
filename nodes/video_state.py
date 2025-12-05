@@ -136,6 +136,57 @@ class VideoPrompt:
             data=(text,)
         )
 
+    @classmethod
+    def create_mask(cls, frame_idx: int, obj_id: int, mask) -> 'VideoPrompt':
+        """
+        Create a mask prompt for initializing tracking from an existing mask.
+
+        Used for chunked video processing where the last frame's mask from
+        chunk N is used to initialize tracking for chunk N+1.
+
+        Args:
+            frame_idx: Frame index where mask is applied (usually 0 for chunk init)
+            obj_id: Object ID for tracking
+            mask: 2D mask tensor [H, W] with values 0-1 or boolean
+
+        Returns:
+            VideoPrompt with mask data
+        """
+        import torch
+        # Store mask as tensor bytes for immutability
+        # Convert to CPU float tensor for consistent storage
+        if isinstance(mask, torch.Tensor):
+            mask_cpu = mask.detach().cpu().float()
+        else:
+            import numpy as np
+            mask_cpu = torch.from_numpy(np.array(mask)).float()
+
+        # Store shape and flattened data as tuple (immutable)
+        shape = tuple(mask_cpu.shape)
+        flat_data = tuple(mask_cpu.flatten().tolist())
+
+        return cls(
+            frame_idx=frame_idx,
+            prompt_type="mask",
+            obj_id=obj_id,
+            data=(shape, flat_data)
+        )
+
+    def get_mask_tensor(self):
+        """
+        Reconstruct mask tensor from stored data.
+
+        Only valid for mask prompts.
+
+        Returns:
+            torch.Tensor of shape stored in data
+        """
+        import torch
+        if self.prompt_type != "mask":
+            raise ValueError(f"get_mask_tensor() only valid for mask prompts, got {self.prompt_type}")
+        shape, flat_data = self.data
+        return torch.tensor(flat_data).reshape(shape)
+
 
 @dataclass(frozen=True)
 class VideoConfig:

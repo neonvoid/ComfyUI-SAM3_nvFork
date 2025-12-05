@@ -25,6 +25,7 @@ from .video_state import (
     VideoPrompt,
     VideoConfig,
     create_video_state,
+    create_temp_dir,
     cleanup_temp_dir,
 )
 from .inference_reconstructor import (
@@ -429,6 +430,17 @@ class SAM3Propagate:
                     "default": False,
                     "tooltip": "Move model to CPU after propagation to free VRAM (slower next run)"
                 }),
+                "enable_chunking": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable chunked processing for long videos to prevent OOM. Splits video into chunks and uses mask-guided continuation."
+                }),
+                "chunk_size": ("INT", {
+                    "default": 250,
+                    "min": 50,
+                    "max": 1000,
+                    "step": 50,
+                    "tooltip": "Number of frames per chunk. Lower values use less VRAM. 250 is good for ~8GB VRAM."
+                }),
             }
         }
 
@@ -438,19 +450,286 @@ class SAM3Propagate:
     CATEGORY = "SAM3/video"
 
     @classmethod
-    def IS_CHANGED(cls, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward", offload_model=False):
+    def IS_CHANGED(cls, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
+                   offload_model=False, enable_chunking=False, chunk_size=250):
         # Use object identity for caching - if upstream node is cached,
         # it returns the same object, so id() will match
         # This is more reliable than hashing content since video_state is immutable
-        result = (id(video_state), start_frame, end_frame, direction)
+        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size)
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: video_state id={id(video_state)}, session={video_state.session_uuid if video_state else None}")
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: returning {result}")
         return result
 
-    def propagate(self, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward", offload_model=False):
+    def _plan_chunks(self, total_frames: int, chunk_size: int, start_frame: int = 0):
+        """
+        Split video into chunks for processing.
+
+        Last frame of chunk N = first frame of chunk N+1 (for mask continuity).
+
+        Args:
+            total_frames: Total number of frames in range
+            chunk_size: Maximum frames per chunk
+            start_frame: Global start frame offset
+
+        Returns:
+            List of chunk dicts with start_frame, end_frame, is_first, chunk_idx
+        """
+        chunks = []
+        local_start = 0
+
+        while local_start < total_frames:
+            local_end = min(local_start + chunk_size - 1, total_frames - 1)
+            chunks.append({
+                "chunk_idx": len(chunks),
+                "local_start": local_start,
+                "local_end": local_end,
+                "global_start": start_frame + local_start,
+                "global_end": start_frame + local_end,
+                "is_first": local_start == 0,
+            })
+            # Next chunk starts at current chunk's last frame (for mask continuity)
+            local_start = local_end
+            if local_start >= total_frames - 1:
+                break
+
+        return chunks
+
+    def _propagate_chunk(self, sam3_model, video_state, chunk, prev_chunk_masks, direction):
+        """
+        Process a single chunk with mask-guided continuation.
+
+        Args:
+            sam3_model: SAM3 model instance
+            video_state: Original video state (for first chunk) or chunk-specific state
+            chunk: Chunk dict from _plan_chunks
+            prev_chunk_masks: Masks from previous chunk's last frame (None for first chunk)
+            direction: Propagation direction
+
+        Returns:
+            Tuple of (chunk_masks_dict, chunk_scores_dict) with local frame indices
+        """
+        import os
+        import shutil
+
+        chunk_idx = chunk["chunk_idx"]
+        global_start = chunk["global_start"]
+        global_end = chunk["global_end"]
+        is_first = chunk["is_first"]
+        num_chunk_frames = global_end - global_start + 1
+
+        print(f"[SAM3 Chunked] Processing chunk {chunk_idx}: frames {global_start}-{global_end} ({num_chunk_frames} frames)")
+
+        # Create a temporary directory for this chunk's frames
+        chunk_session_uuid = f"{video_state.session_uuid}_chunk{chunk_idx}"
+        chunk_temp_dir = create_temp_dir(chunk_session_uuid)
+
+        try:
+            # Copy frames from original temp dir to chunk temp dir with sequential naming
+            for local_idx in range(num_chunk_frames):
+                global_idx = global_start + local_idx
+                src_path = os.path.join(video_state.temp_dir, f"{global_idx:05d}.jpg")
+                dst_path = os.path.join(chunk_temp_dir, f"{local_idx:05d}.jpg")
+                if os.path.exists(src_path):
+                    shutil.copy2(src_path, dst_path)
+                else:
+                    print(f"[SAM3 Chunked] Warning: Missing frame {src_path}")
+
+            # Create chunk-specific video state
+            if is_first:
+                # First chunk: use original prompts on frame 0
+                chunk_state = SAM3VideoState(
+                    session_uuid=chunk_session_uuid,
+                    temp_dir=chunk_temp_dir,
+                    num_frames=num_chunk_frames,
+                    height=video_state.height,
+                    width=video_state.width,
+                    config=video_state.config,
+                    prompts=video_state.prompts,  # Original prompts
+                )
+                print(f"[SAM3 Chunked] First chunk: using {len(video_state.prompts)} original prompts")
+            else:
+                # Subsequent chunks: use mask prompts from previous chunk's last frame
+                chunk_state = SAM3VideoState(
+                    session_uuid=chunk_session_uuid,
+                    temp_dir=chunk_temp_dir,
+                    num_frames=num_chunk_frames,
+                    height=video_state.height,
+                    width=video_state.width,
+                    config=video_state.config,
+                    prompts=(),  # Start empty, add mask prompts
+                )
+
+                # Add mask prompts from previous chunk's last frame
+                if prev_chunk_masks is not None:
+                    # prev_chunk_masks shape: [num_objects, H, W] or similar
+                    # Determine number of objects
+                    if prev_chunk_masks.dim() == 2:
+                        # Single object mask [H, W]
+                        num_objects = 1
+                        masks_to_add = [prev_chunk_masks]
+                    elif prev_chunk_masks.dim() == 3:
+                        # Multi-object mask [num_objects, H, W]
+                        num_objects = prev_chunk_masks.shape[0]
+                        masks_to_add = [prev_chunk_masks[i] for i in range(num_objects)]
+                    elif prev_chunk_masks.dim() == 4:
+                        # Batch mask [1, num_objects, H, W]
+                        num_objects = prev_chunk_masks.shape[1]
+                        masks_to_add = [prev_chunk_masks[0, i] for i in range(num_objects)]
+                    else:
+                        raise ValueError(f"Unexpected mask shape: {prev_chunk_masks.shape}")
+
+                    print(f"[SAM3 Chunked] Adding {num_objects} mask prompts from previous chunk")
+                    for obj_idx, mask in enumerate(masks_to_add):
+                        obj_id = obj_idx + 1  # SAM3 uses 1-indexed obj_ids
+                        # Normalize mask to 0-1 range if needed
+                        if mask.max() > 1.0:
+                            mask = mask.float() / 255.0
+                        prompt = VideoPrompt.create_mask(frame_idx=0, obj_id=obj_id, mask=mask)
+                        chunk_state = chunk_state.with_prompt(prompt)
+
+            # Run propagation for this chunk
+            chunk_masks = {}
+            chunk_scores = {}
+
+            request = {
+                "type": "propagate_in_video",
+                "session_id": chunk_state.session_uuid,
+                "propagation_direction": direction,
+                "start_frame_index": 0,
+                "max_frame_num_to_track": num_chunk_frames,
+            }
+
+            autocast_context = _get_autocast_context()
+            with autocast_context:
+                print_vram(f"Chunk {chunk_idx}: Before reconstruction")
+                inference_state = get_inference_state(sam3_model, chunk_state)
+                print_vram(f"Chunk {chunk_idx}: After reconstruction")
+
+                try:
+                    for response in sam3_model.handle_stream_request(request):
+                        frame_idx = response.get("frame_index", response.get("frame_idx"))
+                        if frame_idx is None:
+                            continue
+
+                        outputs = response.get("outputs", response)
+                        if outputs is None:
+                            continue
+
+                        # Extract mask
+                        mask_key = None
+                        for key in ["out_binary_masks", "video_res_masks", "masks"]:
+                            if key in outputs and outputs[key] is not None:
+                                mask_key = key
+                                break
+
+                        if mask_key:
+                            mask = outputs[mask_key]
+                            if hasattr(mask, 'cpu'):
+                                mask = mask.cpu()
+                            chunk_masks[frame_idx] = mask
+                            del outputs[mask_key]
+
+                        # Extract scores
+                        for score_key in ["out_probs", "scores", "confidences", "obj_scores"]:
+                            if score_key in outputs and outputs[score_key] is not None:
+                                probs = outputs[score_key]
+                                if hasattr(probs, 'cpu'):
+                                    probs = probs.cpu()
+                                elif isinstance(probs, np.ndarray):
+                                    probs = torch.from_numpy(probs)
+                                chunk_scores[frame_idx] = probs
+                                del outputs[score_key]
+                                break
+
+                        outputs.clear()
+
+                        if frame_idx % 16 == 0:
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                except Exception as e:
+                    print(f"[SAM3 Chunked] Chunk {chunk_idx} error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+
+            print(f"[SAM3 Chunked] Chunk {chunk_idx} complete: {len(chunk_masks)} frames")
+
+            # Clear inference state for this chunk to free memory
+            invalidate_session(chunk_state.session_uuid)
+
+        finally:
+            # Cleanup chunk temp directory
+            cleanup_temp_dir(chunk_temp_dir)
+
+        return chunk_masks, chunk_scores
+
+    def _propagate_with_chunking(self, sam3_model, video_state, start_frame, end_frame, direction, chunk_size):
+        """
+        Process video in chunks with mask-guided continuation.
+
+        Args:
+            sam3_model: SAM3 model instance
+            video_state: Original video state
+            start_frame: Global start frame
+            end_frame: Global end frame
+            direction: Propagation direction
+            chunk_size: Frames per chunk
+
+        Returns:
+            Tuple of (masks_dict, scores_dict) with global frame indices
+        """
+        total_frames = end_frame - start_frame + 1
+        chunks = self._plan_chunks(total_frames, chunk_size, start_frame)
+
+        print(f"[SAM3 Chunked] Processing {total_frames} frames in {len(chunks)} chunks")
+        for i, chunk in enumerate(chunks):
+            print(f"[SAM3 Chunked]   Chunk {i}: frames {chunk['global_start']}-{chunk['global_end']}")
+
+        all_masks = {}
+        all_scores = {}
+        prev_chunk_masks = None
+
+        for chunk in chunks:
+            # Process chunk
+            chunk_masks, chunk_scores = self._propagate_chunk(
+                sam3_model, video_state, chunk, prev_chunk_masks, direction
+            )
+
+            # Get last frame's mask for next chunk's initialization
+            if chunk_masks:
+                last_local_frame = max(chunk_masks.keys())
+                prev_chunk_masks = chunk_masks[last_local_frame]
+                print(f"[SAM3 Chunked] Saved mask from frame {last_local_frame} for next chunk (shape: {prev_chunk_masks.shape if hasattr(prev_chunk_masks, 'shape') else 'N/A'})")
+
+            # Merge chunk results into global results
+            # For first chunk, include all frames
+            # For subsequent chunks, skip first frame (it's same as prev chunk's last)
+            for local_idx, mask in chunk_masks.items():
+                global_idx = chunk["global_start"] + local_idx
+                if chunk["is_first"] or local_idx > 0:
+                    all_masks[global_idx] = mask
+
+            for local_idx, score in chunk_scores.items():
+                global_idx = chunk["global_start"] + local_idx
+                if chunk["is_first"] or local_idx > 0:
+                    all_scores[global_idx] = score
+
+            # Cleanup between chunks
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print_vram(f"After chunk {chunk['chunk_idx']}")
+
+        print(f"[SAM3 Chunked] All chunks complete: {len(all_masks)} total frames")
+        return all_masks, all_scores
+
+    def propagate(self, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
+                  offload_model=False, enable_chunking=False, chunk_size=250):
         """Run propagation using reconstructed inference state."""
         # Create cache key using video_state object id (since it's immutable and cached upstream)
-        cache_key = (id(video_state), start_frame, end_frame, direction)
+        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size)
 
         # Check if we have cached result
         if cache_key in SAM3Propagate._cache:
@@ -477,95 +756,95 @@ class SAM3Propagate:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             sam3_model.model.to(device)
 
-        print(f"[SAM3 Video] Starting propagation: frames {start_frame} to {end_frame if end_frame >= 0 else 'end'}")
-        print(f"[SAM3 Video] Prompts: {len(video_state.prompts)}")
-        print_vram("Before propagation start")
-
         # Determine frame range
-        if end_frame < 0:
-            end_frame = video_state.num_frames - 1
+        actual_end_frame = end_frame if end_frame >= 0 else video_state.num_frames - 1
+        total_frames = actual_end_frame - start_frame + 1
 
-        # Build propagation request - uses predictor's handle_stream_request API
-        # direction is already "forward", "backward", or "both"
-        request = {
-            "type": "propagate_in_video",
-            "session_id": video_state.session_uuid,
-            "propagation_direction": direction,
-            "start_frame_index": start_frame,
-            "max_frame_num_to_track": end_frame - start_frame + 1,
-        }
+        # Branch based on chunking mode
+        if enable_chunking and total_frames > chunk_size:
+            print(f"[SAM3 Video] CHUNKED MODE: {total_frames} frames, chunk_size={chunk_size}")
+            masks_dict, scores_dict = self._propagate_with_chunking(
+                sam3_model, video_state, start_frame, actual_end_frame, direction, chunk_size
+            )
+        else:
+            # Standard single-pass propagation
+            print(f"[SAM3 Video] Starting propagation: frames {start_frame} to {actual_end_frame}")
+            print(f"[SAM3 Video] Prompts: {len(video_state.prompts)}")
+            print_vram("Before propagation start")
 
-        # Run ALL inference inside autocast context for dtype consistency
-        # SAM3 requires bf16/fp16 - wrap reconstruction AND propagation
-        masks_dict = {}
-        scores_dict = {}  # Store confidence scores per frame
-        # Use autocast with dtype based on GPU capability (bf16 for Ampere+, fp16 for Volta/Turing)
-        autocast_context = _get_autocast_context()
-        with autocast_context:
-            print_vram("Before reconstruction (in autocast)")
-            # Reconstruct inference state from immutable state
-            inference_state = get_inference_state(sam3_model, video_state)
-            print_vram("After reconstruction")
+            # Build propagation request - uses predictor's handle_stream_request API
+            request = {
+                "type": "propagate_in_video",
+                "session_id": video_state.session_uuid,
+                "propagation_direction": direction,
+                "start_frame_index": start_frame,
+                "max_frame_num_to_track": actual_end_frame - start_frame + 1,
+            }
 
-            # Run propagation
-            try:
-                for response in sam3_model.handle_stream_request(request):
-                    frame_idx = response.get("frame_index", response.get("frame_idx"))
-                    if frame_idx is None:
-                        continue
+            # Run ALL inference inside autocast context for dtype consistency
+            masks_dict = {}
+            scores_dict = {}
+            autocast_context = _get_autocast_context()
+            with autocast_context:
+                print_vram("Before reconstruction (in autocast)")
+                inference_state = get_inference_state(sam3_model, video_state)
+                print_vram("After reconstruction")
 
-                    outputs = response.get("outputs", response)
-                    if outputs is None:
-                        continue
+                # Run propagation
+                try:
+                    for response in sam3_model.handle_stream_request(request):
+                        frame_idx = response.get("frame_index", response.get("frame_idx"))
+                        if frame_idx is None:
+                            continue
 
-                    # Try different possible mask keys
-                    mask_key = None
-                    for key in ["out_binary_masks", "video_res_masks", "masks"]:
-                        if key in outputs and outputs[key] is not None:
-                            mask_key = key
-                            break
+                        outputs = response.get("outputs", response)
+                        if outputs is None:
+                            continue
 
-                    if mask_key:
-                        # Move masks to CPU immediately to free GPU memory (streaming pattern)
-                        mask = outputs[mask_key]
-                        if hasattr(mask, 'cpu'):
-                            mask = mask.cpu()
-                        masks_dict[frame_idx] = mask
-                        # Clear GPU reference
-                        del outputs[mask_key]
+                        # Try different possible mask keys
+                        mask_key = None
+                        for key in ["out_binary_masks", "video_res_masks", "masks"]:
+                            if key in outputs and outputs[key] is not None:
+                                mask_key = key
+                                break
 
-                    # Capture confidence scores
-                    for score_key in ["out_probs", "scores", "confidences", "obj_scores"]:
-                        if score_key in outputs and outputs[score_key] is not None:
-                            probs = outputs[score_key]
-                            if hasattr(probs, 'cpu'):
-                                probs = probs.cpu()
-                            elif isinstance(probs, np.ndarray):
-                                probs = torch.from_numpy(probs)
-                            scores_dict[frame_idx] = probs
-                            # Clear GPU reference
-                            del outputs[score_key]
-                            break
+                        if mask_key:
+                            mask = outputs[mask_key]
+                            if hasattr(mask, 'cpu'):
+                                mask = mask.cpu()
+                            masks_dict[frame_idx] = mask
+                            del outputs[mask_key]
 
-                    # Clear remaining outputs to free GPU memory
-                    outputs.clear()
+                        # Capture confidence scores
+                        for score_key in ["out_probs", "scores", "confidences", "obj_scores"]:
+                            if score_key in outputs and outputs[score_key] is not None:
+                                probs = outputs[score_key]
+                                if hasattr(probs, 'cpu'):
+                                    probs = probs.cpu()
+                                elif isinstance(probs, np.ndarray):
+                                    probs = torch.from_numpy(probs)
+                                scores_dict[frame_idx] = probs
+                                del outputs[score_key]
+                                break
 
-                    # Periodic cleanup and VRAM monitoring (every 16 frames like streaming VAE)
-                    if frame_idx % 16 == 0:
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        print_vram(f"Frame {frame_idx}")
+                        outputs.clear()
 
-            except Exception as e:
-                print(f"[SAM3 Video] Propagation error: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+                        # Periodic cleanup
+                        if frame_idx % 16 == 0:
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            print_vram(f"Frame {frame_idx}")
 
-        print_vram("After propagation loop")
-        print(f"[SAM3 Video] Propagation complete: {len(masks_dict)} frames processed")
-        print(f"[SAM3 Video] Frames with scores: {len(scores_dict)}")
+                except Exception as e:
+                    print(f"[SAM3 Video] Propagation error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+
+            print_vram("After propagation loop")
+            print(f"[SAM3 Video] Propagation complete: {len(masks_dict)} frames processed")
+            print(f"[SAM3 Video] Frames with scores: {len(scores_dict)}")
 
         # Clean up
         gc.collect()

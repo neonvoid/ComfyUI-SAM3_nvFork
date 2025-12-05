@@ -193,6 +193,20 @@ class InferenceReconstructor:
                 text=text,
             )
 
+        elif prompt.prompt_type == "mask":
+            # Reconstruct mask tensor from stored data
+            mask_tensor = prompt.get_mask_tensor()
+
+            print(f"[SAM3 Video] Applying mask prompt: frame={prompt.frame_idx}, obj={prompt.obj_id}, "
+                  f"mask_shape={mask_tensor.shape}")
+
+            model.add_new_mask(
+                session_id=session_id,
+                frame_idx=prompt.frame_idx,
+                obj_id=prompt.obj_id,
+                mask=mask_tensor,
+            )
+
     def invalidate(self, session_uuid: str):
         """
         Invalidate all cached states for a session.

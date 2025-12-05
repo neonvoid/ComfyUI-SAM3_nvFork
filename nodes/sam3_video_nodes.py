@@ -1016,6 +1016,25 @@ class SAM3Propagate:
                     if frame_idx is None:
                         continue
 
+                    # CRITICAL: Clear PREVIOUS frames from SAM3's internal cache IMMEDIATELY
+                    # This must happen at the START of each iteration because SAM3 caches
+                    # masks BEFORE yielding, and OOM can occur during _postprocess_output
+                    # before we even receive this response.
+                    cached_outputs = inference_state.get("cached_frame_outputs", {})
+                    frames_to_clear = [f for f in list(cached_outputs.keys()) if f < frame_idx]
+                    if frames_to_clear:
+                        for f in frames_to_clear:
+                            del cached_outputs[f]
+                        # Also clear associated tracker metadata for old frames
+                        tracker_metadata = inference_state.get("tracker_metadata", {})
+                        frame_wise_scores = tracker_metadata.get("obj_id_to_tracker_score_frame_wise", {})
+                        for f in frames_to_clear:
+                            frame_wise_scores.pop(f, None)
+                        # Aggressive cleanup after clearing cache
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
                     outputs = response.get("outputs", response)
                     if outputs is None:
                         continue
@@ -1066,9 +1085,7 @@ class SAM3Propagate:
                     mask_path = os.path.join(mask_dir, f"{frame_idx:05d}.npz")
                     np.savez_compressed(mask_path, mask=mask.numpy())
 
-                    # CRITICAL: Clear this frame from SAM3's internal cache to free VRAM
-                    # This prevents cached_frame_outputs from accumulating all frames (~30-50GB)
-                    cached_outputs = inference_state.get("cached_frame_outputs", {})
+                    # Also clear the CURRENT frame from cache (after writing to disk)
                     if frame_idx in cached_outputs:
                         del cached_outputs[frame_idx]
 
@@ -1076,11 +1093,10 @@ class SAM3Propagate:
                     del mask
                     outputs.clear()
 
-                    # Periodic cleanup
-                    if frame_idx % 16 == 0:
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                    # Run cleanup every frame during streaming to prevent memory buildup
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                     # Progress logging
                     if frame_idx % 50 == 0:

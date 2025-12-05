@@ -536,7 +536,25 @@ class SAM3Propagate:
 
             # Create chunk-specific video state
             if is_first:
-                # First chunk: use original prompts on frame 0
+                # First chunk: use original prompts but adjusted to local frame 0
+                # Original prompts may reference any frame, but chunk 0 starts at global_start
+                # So we need to remap prompt frames to local indices
+                adjusted_prompts = []
+                for prompt in video_state.prompts:
+                    # Calculate local frame index
+                    local_frame = prompt.frame_idx - global_start
+                    if 0 <= local_frame < num_chunk_frames:
+                        # Create new prompt with adjusted frame index
+                        adjusted_prompt = VideoPrompt(
+                            frame_idx=local_frame,
+                            prompt_type=prompt.prompt_type,
+                            obj_id=prompt.obj_id,
+                            data=prompt.data
+                        )
+                        adjusted_prompts.append(adjusted_prompt)
+                    else:
+                        print(f"[SAM3 Chunked] Warning: Prompt frame {prompt.frame_idx} outside chunk range, skipping")
+
                 chunk_state = SAM3VideoState(
                     session_uuid=chunk_session_uuid,
                     temp_dir=chunk_temp_dir,
@@ -544,9 +562,9 @@ class SAM3Propagate:
                     height=video_state.height,
                     width=video_state.width,
                     config=video_state.config,
-                    prompts=video_state.prompts,  # Original prompts
+                    prompts=tuple(adjusted_prompts),
                 )
-                print(f"[SAM3 Chunked] First chunk: using {len(video_state.prompts)} original prompts")
+                print(f"[SAM3 Chunked] First chunk: using {len(adjusted_prompts)} prompts (adjusted to local frame indices)")
             else:
                 # Subsequent chunks: use mask prompts from previous chunk's last frame
                 chunk_state = SAM3VideoState(
@@ -561,6 +579,10 @@ class SAM3Propagate:
 
                 # Add mask prompts from previous chunk's last frame
                 if prev_chunk_masks is not None:
+                    # Convert numpy array to torch tensor if needed
+                    if isinstance(prev_chunk_masks, np.ndarray):
+                        prev_chunk_masks = torch.from_numpy(prev_chunk_masks)
+
                     # prev_chunk_masks shape: [num_objects, H, W] or similar
                     # Determine number of objects
                     if prev_chunk_masks.dim() == 2:

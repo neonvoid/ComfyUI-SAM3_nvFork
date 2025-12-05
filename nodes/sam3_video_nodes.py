@@ -1066,6 +1066,12 @@ class SAM3Propagate:
                     mask_path = os.path.join(mask_dir, f"{frame_idx:05d}.npz")
                     np.savez_compressed(mask_path, mask=mask.numpy())
 
+                    # CRITICAL: Clear this frame from SAM3's internal cache to free VRAM
+                    # This prevents cached_frame_outputs from accumulating all frames (~30-50GB)
+                    cached_outputs = inference_state.get("cached_frame_outputs", {})
+                    if frame_idx in cached_outputs:
+                        del cached_outputs[frame_idx]
+
                     # Clear reference to allow GC
                     del mask
                     outputs.clear()

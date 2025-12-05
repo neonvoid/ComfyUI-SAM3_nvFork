@@ -844,8 +844,8 @@ class SAM3Propagate:
                             if obj_id not in object_ranges:
                                 # First time seeing this object
                                 object_ranges[obj_id] = {
-                                    "first": frame_idx,
-                                    "last": frame_idx,
+                                    "min_frame": frame_idx,
+                                    "max_frame": frame_idx,
                                     "visible_count": 1
                                 }
                                 boundary_masks[obj_id] = {
@@ -855,11 +855,19 @@ class SAM3Propagate:
                                     "last_frame": frame_idx
                                 }
                             else:
-                                # Update last seen frame
-                                object_ranges[obj_id]["last"] = frame_idx
+                                # Update min/max frame (handles any iteration order)
+                                prev_min = object_ranges[obj_id]["min_frame"]
+                                prev_max = object_ranges[obj_id]["max_frame"]
                                 object_ranges[obj_id]["visible_count"] += 1
-                                boundary_masks[obj_id]["last_mask"] = obj_mask.clone()
-                                boundary_masks[obj_id]["last_frame"] = frame_idx
+
+                                if frame_idx < prev_min:
+                                    object_ranges[obj_id]["min_frame"] = frame_idx
+                                    boundary_masks[obj_id]["first_mask"] = obj_mask.clone()
+                                    boundary_masks[obj_id]["first_frame"] = frame_idx
+                                if frame_idx > prev_max:
+                                    object_ranges[obj_id]["max_frame"] = frame_idx
+                                    boundary_masks[obj_id]["last_mask"] = obj_mask.clone()
+                                    boundary_masks[obj_id]["last_frame"] = frame_idx
 
                     # Clear the mask tensor to free memory
                     del mask
@@ -888,8 +896,8 @@ class SAM3Propagate:
             "objects": [
                 {
                     "id": obj_id,
-                    "first_frame": ranges["first"],
-                    "last_frame": ranges["last"],
+                    "first_frame": ranges["min_frame"],
+                    "last_frame": ranges["max_frame"],
                     "visible_frames": ranges["visible_count"]
                 }
                 for obj_id, ranges in sorted(object_ranges.items())
@@ -903,7 +911,7 @@ class SAM3Propagate:
         # Log results
         print(f"[SAM3 Video] Range detection complete: {len(object_ranges)} objects tracked")
         for obj_id, ranges in sorted(object_ranges.items()):
-            print(f"[SAM3 Video]   Object {obj_id}: frames {ranges['first']}-{ranges['last']} ({ranges['visible_count']} visible)")
+            print(f"[SAM3 Video]   Object {obj_id}: frames {ranges['min_frame']}-{ranges['max_frame']} ({ranges['visible_count']} visible)")
 
         # Build boundary masks output
         # Structure: {frame_idx: mask_tensor} containing only boundary frames

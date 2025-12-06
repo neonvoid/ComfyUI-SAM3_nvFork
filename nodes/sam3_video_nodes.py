@@ -453,6 +453,24 @@ class SAM3Propagate:
                     "default": "",
                     "tooltip": "Custom directory to save streamed masks (only used when stream_to_disk=True). Leave empty for auto temp dir. Masks are saved as {frame:05d}.npz"
                 }),
+                "auto_exit_on_empty": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Stop propagation when user-selected objects leave frame. Returns only valid frames."
+                }),
+                "exit_delay_seconds": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.1,
+                    "max": 5.0,
+                    "step": 0.1,
+                    "tooltip": "Seconds of consecutive empty frames before stopping (scales with video_fps)"
+                }),
+                "video_fps": ("FLOAT", {
+                    "default": 30.0,
+                    "min": 1.0,
+                    "max": 120.0,
+                    "step": 0.1,
+                    "tooltip": "Video framerate for exit delay calculation"
+                }),
             }
         }
 
@@ -464,11 +482,12 @@ class SAM3Propagate:
     @classmethod
     def IS_CHANGED(cls, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
                    offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False,
-                   stream_to_disk=False, mask_output_path=""):
+                   stream_to_disk=False, mask_output_path="", auto_exit_on_empty=False,
+                   exit_delay_seconds=0.5, video_fps=30.0):
         # Use object identity for caching - if upstream node is cached,
         # it returns the same object, so id() will match
         # This is more reliable than hashing content since video_state is immutable
-        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path)
+        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps)
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: video_state id={id(video_state)}, session={video_state.session_uuid if video_state else None}")
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: returning {result}")
         return result
@@ -1139,10 +1158,11 @@ class SAM3Propagate:
 
     def propagate(self, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
                   offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False,
-                  stream_to_disk=False, mask_output_path=""):
+                  stream_to_disk=False, mask_output_path="", auto_exit_on_empty=False,
+                  exit_delay_seconds=0.5, video_fps=30.0):
         """Run propagation using reconstructed inference state."""
         # Create cache key using video_state object id (since it's immutable and cached upstream)
-        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path)
+        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps)
 
         # Check if we have cached result
         if cache_key in SAM3Propagate._cache:
@@ -1211,6 +1231,15 @@ class SAM3Propagate:
             # Run ALL inference inside autocast context for dtype consistency
             masks_dict = {}
             scores_dict = {}
+
+            # Early exit tracking
+            consecutive_empty_frames = 0
+            last_valid_frame = start_frame
+            early_exit_triggered = False
+            empty_frames_threshold = max(1, int(exit_delay_seconds * video_fps)) if auto_exit_on_empty else float('inf')
+            if auto_exit_on_empty:
+                print(f"[SAM3 Video] Early exit enabled: {exit_delay_seconds}s @ {video_fps}fps = {empty_frames_threshold} frames threshold")
+
             autocast_context = _get_autocast_context()
             with autocast_context:
                 print_vram("Before reconstruction (in autocast)")
@@ -1242,6 +1271,31 @@ class SAM3Propagate:
                             masks_dict[frame_idx] = mask
                             del outputs[mask_key]
 
+                            # Early exit: check if mask is empty (all objects left frame)
+                            if auto_exit_on_empty:
+                                mask_is_empty = (mask is None or
+                                                (hasattr(mask, 'shape') and mask.shape[0] == 0) or
+                                                (hasattr(mask, 'numel') and mask.numel() == 0))
+                                if mask_is_empty:
+                                    consecutive_empty_frames += 1
+                                else:
+                                    consecutive_empty_frames = 0
+                                    last_valid_frame = frame_idx
+
+                                if consecutive_empty_frames >= empty_frames_threshold:
+                                    early_exit_triggered = True
+                                    print(f"[SAM3 Video] Early exit: no objects for {consecutive_empty_frames} consecutive frames")
+                                    print(f"[SAM3 Video] Last valid frame: {last_valid_frame}")
+                                    break
+                        else:
+                            # No mask found - count as empty
+                            if auto_exit_on_empty:
+                                consecutive_empty_frames += 1
+                                if consecutive_empty_frames >= empty_frames_threshold:
+                                    early_exit_triggered = True
+                                    print(f"[SAM3 Video] Early exit: no masks for {consecutive_empty_frames} consecutive frames")
+                                    break
+
                         # Capture confidence scores
                         for score_key in ["out_probs", "scores", "confidences", "obj_scores"]:
                             if score_key in outputs and outputs[score_key] is not None:
@@ -1272,6 +1326,35 @@ class SAM3Propagate:
             print_vram("After propagation loop")
             print(f"[SAM3 Video] Propagation complete: {len(masks_dict)} frames processed")
             print(f"[SAM3 Video] Frames with scores: {len(scores_dict)}")
+
+            # Handle early exit: truncate output and create metadata
+            if auto_exit_on_empty:
+                if early_exit_triggered:
+                    # Truncate masks_dict to only include valid frames
+                    frames_to_remove = [f for f in masks_dict.keys() if f > last_valid_frame]
+                    for f in frames_to_remove:
+                        del masks_dict[f]
+
+                    # Truncate scores_dict similarly
+                    frames_to_remove = [f for f in scores_dict.keys() if f > last_valid_frame]
+                    for f in frames_to_remove:
+                        del scores_dict[f]
+
+                    print(f"[SAM3 Video] Truncated output to {len(masks_dict)} valid frames (0-{last_valid_frame})")
+
+                # Create track_info with early exit metadata
+                track_info = {
+                    "early_exit_enabled": True,
+                    "early_exit_triggered": early_exit_triggered,
+                    "exit_delay_seconds": exit_delay_seconds,
+                    "video_fps": video_fps,
+                    "empty_frames_threshold": empty_frames_threshold,
+                    "last_valid_frame": last_valid_frame,
+                    "total_valid_frames": len(masks_dict),
+                    "original_end_frame": actual_end_frame,
+                    "start_frame": start_frame,
+                }
+                track_info_json = json.dumps(track_info, indent=2)
 
         # Clean up
         gc.collect()

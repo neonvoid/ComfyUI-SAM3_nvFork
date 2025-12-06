@@ -1307,9 +1307,9 @@ class SAM3VideoOutput:
     Extract masks from propagation results.
 
     Converts SAM3_VIDEO_MASKS to ComfyUI-compatible mask tensors.
-    Returns all frames as a batch.
+    Returns all frames as a batch with all object masks combined.
 
-    Changing obj_id does NOT re-run propagation - only this node re-executes.
+    For per-object mask selection, use SAM3MaskTracks instead.
     """
     # Class-level cache for extraction results
     _cache = {}
@@ -1332,7 +1332,7 @@ class SAM3VideoOutput:
                 "obj_id": ("INT", {
                     "default": -1,
                     "min": -1,
-                    "tooltip": "Specific object ID for mask output (-1 for all combined). Changing this is fast - no re-inference needed."
+                    "tooltip": "Object index for visualization coloring only. Mask output always combines all objects. Use SAM3MaskTracks for per-object masks."
                 }),
                 "plot_all_masks": ("BOOLEAN", {
                     "default": True,
@@ -1515,14 +1515,10 @@ class SAM3VideoOutput:
                                 om = om / 255.0
                             combined_mask = torch.max(combined_mask, om)
 
-                    # For mask output, select based on obj_id
-                    if obj_id >= 0 and obj_id < frame_mask.shape[0]:
-                        output_mask = frame_mask[obj_id].float()
-                        if output_mask.numel() > 0 and output_mask.max() > 1.0:
-                            output_mask = output_mask / 255.0
-                    else:
-                        output_mask = combined_mask
-                    frame_mask = output_mask
+                    # Always output combined mask (all objects merged)
+                    # Note: obj_id selection was broken - it treated obj_id as array index
+                    # but SAM3 object IDs don't match array indices across frames
+                    frame_mask = combined_mask
                 else:
                     # Single mask
                     if frame_mask.dim() == 3:

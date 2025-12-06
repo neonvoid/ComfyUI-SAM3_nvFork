@@ -292,36 +292,22 @@ class Sam3VideoPredictor:
 
             # First doing the forward propagation
             if propagation_direction in ["both", "forward"]:
-                for frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores in self.model.propagate_in_video(
+                for frame_idx, outputs in self.model.propagate_in_video(
                     inference_state=inference_state,
                     start_frame_idx=start_frame_idx,
                     max_frame_num_to_track=max_frame_num_to_track,
                     reverse=False,
                 ):
-                    yield {
-                        "frame_index": frame_idx,
-                        "outputs": {
-                            "obj_ids": obj_ids,
-                            "video_res_masks": video_res_masks,
-                            "obj_scores": obj_scores,
-                        }
-                    }
+                    yield {"frame_index": frame_idx, "outputs": outputs}
             # Then doing the backward propagation (reverse in time)
             if propagation_direction in ["both", "backward"]:
-                for frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores in self.model.propagate_in_video(
+                for frame_idx, outputs in self.model.propagate_in_video(
                     inference_state=inference_state,
                     start_frame_idx=start_frame_idx,
                     max_frame_num_to_track=max_frame_num_to_track,
                     reverse=True,
                 ):
-                    yield {
-                        "frame_index": frame_idx,
-                        "outputs": {
-                            "obj_ids": obj_ids,
-                            "video_res_masks": video_res_masks,
-                            "obj_scores": obj_scores,
-                        }
-                    }
+                    yield {"frame_index": frame_idx, "outputs": outputs}
         finally:
             # Log upon completion (so that e.g. we can see if two propagations happen in parallel).
             # Using `finally` here to log even when the tracking is aborted with GeneratorExit.

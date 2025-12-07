@@ -1665,14 +1665,27 @@ class SAM3VideoOutput:
 
 class SAM3VideoTrim:
     """
-    Trim video frames based on track_info from SAM3Propagate.
+    Trim video frames and extract masks based on track_info from SAM3Propagate.
 
-    Use this after SAM3Propagate with auto_exit_on_empty=True to trim
-    the original video frames to match the truncated mask output.
+    Use this after SAM3Propagate with auto_exit_on_empty=True to:
+    1. Trim original video frames to match the truncated mask output
+    2. Extract and combine masks for the valid frame range
+    3. Generate colored visualization overlay
 
-    This allows the downstream workflow to have matching frame counts
-    between video and masks.
+    This is a complete endpoint node - outputs trimmed video, masks, and visualization.
     """
+
+    # Color palette for visualization (RGB, 0-1 range)
+    COLORS = [
+        [0.0, 0.5, 1.0],   # Blue
+        [1.0, 0.3, 0.3],   # Red
+        [0.3, 1.0, 0.3],   # Green
+        [1.0, 1.0, 0.0],   # Yellow
+        [1.0, 0.0, 1.0],   # Magenta
+        [0.0, 1.0, 1.0],   # Cyan
+        [1.0, 0.5, 0.0],   # Orange
+        [0.5, 0.0, 1.0],   # Purple
+    ]
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1681,28 +1694,48 @@ class SAM3VideoTrim:
                 "video_frames": ("IMAGE", {
                     "tooltip": "Original video frames [N, H, W, C]"
                 }),
+                "masks": ("SAM3_VIDEO_MASKS", {
+                    "tooltip": "Masks dict from SAM3Propagate"
+                }),
                 "track_info": ("STRING", {
                     "forceInput": True,
                     "tooltip": "JSON track info from SAM3Propagate (with early exit metadata)"
                 }),
             },
+            "optional": {
+                "scores": ("SAM3_VIDEO_SCORES", {
+                    "tooltip": "Confidence scores from SAM3Propagate"
+                }),
+                "viz_alpha": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Mask overlay transparency for visualization"
+                }),
+            },
         }
 
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT")
-    RETURN_NAMES = ("trimmed_frames", "start_frame", "end_frame", "total_frames")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "INT", "INT", "INT")
+    RETURN_NAMES = ("trimmed_frames", "masks", "visualization", "start_frame", "end_frame", "total_frames")
     FUNCTION = "trim_video"
     CATEGORY = "SAM3/video"
 
-    def trim_video(self, video_frames, track_info):
+    def trim_video(self, video_frames, masks, track_info, scores=None, viz_alpha=0.5):
         """
-        Trim video frames to match the valid frame range from early exit.
+        Trim video frames and extract masks/visualization for valid frame range.
 
         Args:
             video_frames: Original video frames [N, H, W, C]
+            masks: Dict of frame_idx -> mask tensor from SAM3Propagate
             track_info: JSON string with early exit metadata
+            scores: Optional confidence scores dict
+            viz_alpha: Transparency for mask overlay
 
         Returns:
             trimmed_frames: Sliced video frames
+            masks: Combined mask tensor [N, H, W]
+            visualization: Colored overlay frames [N, H, W, C]
             start_frame: Start frame index
             end_frame: End frame index (inclusive)
             total_frames: Number of frames in output
@@ -1713,7 +1746,9 @@ class SAM3VideoTrim:
         except json.JSONDecodeError as e:
             print(f"[SAM3 VideoTrim] Error parsing track_info JSON: {e}")
             print(f"[SAM3 VideoTrim] Returning original frames unchanged")
-            return (video_frames, 0, video_frames.shape[0] - 1, video_frames.shape[0])
+            h, w = video_frames.shape[1], video_frames.shape[2]
+            empty_mask = torch.zeros(video_frames.shape[0], h, w)
+            return (video_frames, empty_mask, video_frames.clone(), 0, video_frames.shape[0] - 1, video_frames.shape[0])
 
         # Extract frame range
         start_frame = info.get("start_frame", 0)
@@ -1728,6 +1763,7 @@ class SAM3VideoTrim:
         # Slice video frames
         trimmed = video_frames[start_frame:end_frame + 1]
         total_frames = trimmed.shape[0]
+        h, w = trimmed.shape[1], trimmed.shape[2]
 
         if early_exit_triggered:
             print(f"[SAM3 VideoTrim] Early exit detected - trimming video")
@@ -1736,7 +1772,68 @@ class SAM3VideoTrim:
         else:
             print(f"[SAM3 VideoTrim] No early exit - frames {start_frame}-{end_frame} ({total_frames} frames)")
 
-        return (trimmed, start_frame, end_frame, total_frames)
+        # Extract and process masks for valid frame range
+        mask_list = []
+        vis_list = []
+
+        for out_idx, frame_idx in enumerate(range(start_frame, end_frame + 1)):
+            # Get frame from trimmed video
+            frame_tensor = trimmed[out_idx]
+            vis_frame = frame_tensor.clone()
+
+            # Get mask for this frame
+            if frame_idx in masks:
+                frame_mask = masks[frame_idx]
+
+                # Convert numpy to torch if needed
+                if isinstance(frame_mask, np.ndarray):
+                    frame_mask = torch.from_numpy(frame_mask)
+
+                # Handle dimensions
+                if frame_mask.dim() == 4:
+                    frame_mask = frame_mask.squeeze(0)  # Remove batch dim
+
+                # Check for empty mask
+                if frame_mask.numel() == 0 or (frame_mask.dim() == 3 and frame_mask.shape[0] == 0):
+                    combined_mask = torch.zeros(h, w)
+                elif frame_mask.dim() == 3 and frame_mask.shape[0] >= 1:
+                    # Multi-object mask - combine all and create visualization
+                    combined_mask = torch.zeros(h, w)
+                    for obj_idx in range(frame_mask.shape[0]):
+                        obj_mask = frame_mask[obj_idx].float()
+                        if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
+                            obj_mask = obj_mask / 255.0
+                        # Add to combined mask
+                        combined_mask = torch.max(combined_mask, obj_mask)
+                        # Add colored overlay to visualization
+                        color = torch.tensor(self.COLORS[obj_idx % len(self.COLORS)])
+                        mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
+                        vis_frame = vis_frame * (1 - viz_alpha * obj_mask.unsqueeze(-1)) + viz_alpha * mask_rgb
+                else:
+                    # Single mask
+                    if frame_mask.dim() == 3:
+                        frame_mask = frame_mask.squeeze(0)
+                    combined_mask = frame_mask.float()
+                    if combined_mask.numel() > 0 and combined_mask.max() > 1.0:
+                        combined_mask = combined_mask / 255.0
+                    # Add colored overlay
+                    color = torch.tensor(self.COLORS[0])
+                    mask_rgb = combined_mask.unsqueeze(-1) * color.view(1, 1, 3)
+                    vis_frame = vis_frame * (1 - viz_alpha * combined_mask.unsqueeze(-1)) + viz_alpha * mask_rgb
+            else:
+                # No mask for this frame
+                combined_mask = torch.zeros(h, w)
+
+            mask_list.append(combined_mask.cpu())
+            vis_list.append(vis_frame.clamp(0, 1))
+
+        # Stack into batches
+        all_masks = torch.stack(mask_list, dim=0)  # [N, H, W]
+        all_vis = torch.stack(vis_list, dim=0)  # [N, H, W, C]
+
+        print(f"[SAM3 VideoTrim] Output: {total_frames} frames, masks shape {all_masks.shape}")
+
+        return (trimmed, all_masks, all_vis, start_frame, end_frame, total_frames)
 
 
 # =============================================================================

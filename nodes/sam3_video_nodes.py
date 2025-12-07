@@ -83,6 +83,143 @@ def print_vram(label: str, detailed: bool = False):
 
 
 # =============================================================================
+# VRAM Estimation
+# =============================================================================
+
+class SAM3VRAMEstimator:
+    """
+    Estimate VRAM requirements and max processable frames.
+
+    Use this before SAM3Propagate to check if your video will fit in VRAM.
+    Returns estimated max frames and recommended chunk size for chunked mode.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_state": ("SAM3_VIDEO_STATE", {
+                    "tooltip": "Video state with resolution and frame count"
+                }),
+            },
+            "optional": {
+                "sam3_model": ("SAM3_MODEL", {
+                    "tooltip": "SAM3 model (optional, for more accurate estimation)"
+                }),
+                "safety_margin_gb": ("FLOAT", {
+                    "default": 1.5,
+                    "min": 0.5,
+                    "max": 8.0,
+                    "step": 0.5,
+                    "tooltip": "VRAM safety margin in GB (reserve for other processes)"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("INT", "FLOAT", "FLOAT", "BOOLEAN", "INT", "STRING")
+    RETURN_NAMES = ("max_frames", "available_vram_gb", "per_frame_mb", "can_process_all", "recommended_chunk_size", "vram_report")
+    FUNCTION = "estimate_vram"
+    CATEGORY = "SAM3/video"
+
+    def estimate_vram(self, video_state, sam3_model=None, safety_margin_gb=1.5):
+        """
+        Estimate VRAM requirements based on video resolution and frame count.
+
+        Empirical formula based on observed memory patterns:
+        - Model base: ~3.3GB
+        - Frame loading: ~5.7MB per frame (scales with resolution)
+        - Propagation: ~2.2MB per frame accumulated (memory bank growth)
+        """
+        if not torch.cuda.is_available():
+            return (0, 0.0, 0.0, False, 0, "CUDA not available")
+
+        # Get video dimensions
+        H = video_state.height
+        W = video_state.width
+        num_frames = video_state.num_frames
+        pixels = H * W
+
+        # Get current VRAM status
+        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        current_used = torch.cuda.memory_allocated() / (1024**3)
+        current_reserved = torch.cuda.memory_reserved() / (1024**3)
+
+        # Empirical per-frame costs (based on observed patterns)
+        # These scale with resolution relative to 1080p baseline
+        resolution_scale = pixels / (1920 * 1080)
+
+        # Base costs (empirical from 1080p testing)
+        frame_load_mb = 5.7 * resolution_scale  # Memory for frame in state
+        propagation_mb = 2.2 * resolution_scale  # Memory bank growth per frame
+        per_frame_total_mb = frame_load_mb + propagation_mb
+
+        # Model overhead (already loaded if sam3_model provided)
+        model_overhead_gb = 0.0 if sam3_model is not None else 3.3
+
+        # Available VRAM for frames
+        available_gb = total_vram - current_used - safety_margin_gb - model_overhead_gb
+        available_mb = available_gb * 1024
+
+        # Calculate max frames
+        if per_frame_total_mb > 0:
+            max_frames = int(available_mb / per_frame_total_mb)
+        else:
+            max_frames = num_frames
+
+        max_frames = max(1, max_frames)  # At least 1 frame
+
+        # Check if we can process all frames
+        can_process_all = max_frames >= num_frames
+
+        # Recommended chunk size (80% of max for safety)
+        recommended_chunk_size = max(50, int(max_frames * 0.8))
+        recommended_chunk_size = min(recommended_chunk_size, 500)  # Cap at 500
+
+        # Generate report
+        report_lines = [
+            f"=== SAM3 VRAM Estimation ===",
+            f"Video: {W}x{H}, {num_frames} frames",
+            f"Resolution scale: {resolution_scale:.2f}x (vs 1080p)",
+            f"",
+            f"VRAM Status:",
+            f"  Total: {total_vram:.2f} GB",
+            f"  Currently used: {current_used:.2f} GB",
+            f"  Reserved: {current_reserved:.2f} GB",
+            f"  Safety margin: {safety_margin_gb:.1f} GB",
+            f"  Available for processing: {available_gb:.2f} GB",
+            f"",
+            f"Per-frame cost: {per_frame_total_mb:.2f} MB",
+            f"  Frame loading: {frame_load_mb:.2f} MB",
+            f"  Propagation: {propagation_mb:.2f} MB",
+            f"",
+            f"Estimation:",
+            f"  Max safe frames: {max_frames}",
+            f"  Video frames: {num_frames}",
+            f"  Can process all: {'YES' if can_process_all else 'NO'}",
+        ]
+
+        if not can_process_all:
+            report_lines.extend([
+                f"",
+                f"RECOMMENDATION:",
+                f"  Use chunked mode with chunk_size={recommended_chunk_size}",
+                f"  Or use stream_to_disk=True for unlimited length",
+            ])
+
+        vram_report = "\n".join(report_lines)
+        print(f"[SAM3 VRAM] {vram_report}")
+
+        return (
+            max_frames,
+            round(available_gb, 2),
+            round(per_frame_total_mb, 2),
+            can_process_all,
+            recommended_chunk_size,
+            vram_report
+        )
+
+
+# =============================================================================
 # Video Segmentation Nodes
 # =============================================================================
 # NOTE: SAM3VideoModelLoader has been removed.
@@ -475,8 +612,8 @@ class SAM3Propagate:
             }
         }
 
-    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SCORES", "SAM3_VIDEO_STATE", "STRING", "STRING")
-    RETURN_NAMES = ("masks", "scores", "video_state", "track_info", "mask_dir")
+    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SCORES", "SAM3_VIDEO_STATE", "STRING", "STRING", "SAM3_VIDEO_OBJ_IDS")
+    RETURN_NAMES = ("masks", "scores", "video_state", "track_info", "mask_dir", "obj_ids")
     FUNCTION = "propagate"
     CATEGORY = "SAM3/video"
 
@@ -1194,9 +1331,10 @@ class SAM3Propagate:
         actual_end_frame = end_frame if end_frame >= 0 else video_state.num_frames - 1
         total_frames = actual_end_frame - start_frame + 1
 
-        # Initialize track_info and mask_dir (will be populated in range detection/streaming modes)
+        # Initialize track_info, mask_dir, and obj_ids (will be populated in range detection/streaming modes)
         track_info_json = ""
         mask_dir = ""
+        obj_ids_dict = {}  # For stable color mapping (only populated in standard mode)
 
         # Branch based on mode
         if stream_to_disk:
@@ -1232,6 +1370,7 @@ class SAM3Propagate:
             # Run ALL inference inside autocast context for dtype consistency
             masks_dict = {}
             scores_dict = {}
+            obj_ids_dict = {}  # Store object IDs for stable color mapping
 
             # Early exit tracking
             consecutive_empty_frames = 0
@@ -1271,6 +1410,16 @@ class SAM3Propagate:
                                 mask = mask.cpu()
                             masks_dict[frame_idx] = mask
                             del outputs[mask_key]
+
+                            # Capture object IDs for stable color mapping
+                            if "obj_ids" in outputs and outputs["obj_ids"] is not None:
+                                ids = outputs["obj_ids"]
+                                if hasattr(ids, 'tolist'):
+                                    ids = ids.tolist()
+                                elif isinstance(ids, np.ndarray):
+                                    ids = ids.tolist()
+                                obj_ids_dict[frame_idx] = ids
+                                del outputs["obj_ids"]
 
                             # Early exit: check if mask is empty (all objects left frame)
                             if auto_exit_on_empty:
@@ -1376,7 +1525,7 @@ class SAM3Propagate:
             print_vram("After model offload")
 
         # Cache the result
-        result = (masks_dict, scores_dict, video_state, track_info_json, mask_dir)
+        result = (masks_dict, scores_dict, video_state, track_info_json, mask_dir, obj_ids_dict)
         SAM3Propagate._cache[cache_key] = result
 
         return result
@@ -1413,6 +1562,9 @@ class SAM3VideoOutput:
                 "scores": ("SAM3_VIDEO_SCORES", {
                     "tooltip": "Confidence scores from SAM3Propagate"
                 }),
+                "obj_ids": ("SAM3_VIDEO_OBJ_IDS", {
+                    "tooltip": "Object IDs from SAM3Propagate (for stable color mapping)"
+                }),
                 "obj_id": ("INT", {
                     "default": -1,
                     "min": -1,
@@ -1430,11 +1582,11 @@ class SAM3VideoOutput:
         }
 
     @classmethod
-    def IS_CHANGED(cls, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True, draw_legend=True):
+    def IS_CHANGED(cls, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True):
         # Always re-run this node when params change, but this is cheap
         # The key is that changing these here does NOT invalidate upstream cache
         # ComfyUI caches based on input values - masks/video_state don't change
-        return (id(masks), video_state.session_uuid, id(scores), obj_id, plot_all_masks, draw_legend)
+        return (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend)
 
     RETURN_TYPES = ("MASK", "IMAGE", "IMAGE")
     RETURN_NAMES = ("masks", "frames", "visualization")
@@ -1493,13 +1645,13 @@ class SAM3VideoOutput:
 
         return vis_frame
 
-    def extract(self, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True, draw_legend=True):
+    def extract(self, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True):
         """Extract all masks as a batch [N, H, W]."""
         from PIL import Image
         import os
 
         # Create cache key
-        cache_key = (id(masks), video_state.session_uuid, id(scores), obj_id, plot_all_masks, draw_legend)
+        cache_key = (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend)
 
         # Check if we have cached result
         if cache_key in SAM3VideoOutput._cache:
@@ -1564,6 +1716,11 @@ class SAM3VideoOutput:
                 # Create visualization with colored overlays
                 vis_frame = img_tensor.clone()
 
+                # Get object IDs for this frame (for stable color mapping)
+                frame_obj_ids = None
+                if obj_ids is not None and frame_idx in obj_ids:
+                    frame_obj_ids = obj_ids[frame_idx]
+
                 # Check for empty mask (no detections)
                 if frame_mask.numel() == 0 or (frame_mask.dim() == 3 and frame_mask.shape[0] == 0):
                     # No detections - use empty mask
@@ -1579,7 +1736,12 @@ class SAM3VideoOutput:
                             obj_mask = frame_mask[oid].float()
                             if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
                                 obj_mask = obj_mask / 255.0
-                            color = torch.tensor(colors[oid % len(colors)])
+                            # Use stable object ID for color (if available)
+                            if frame_obj_ids is not None and oid < len(frame_obj_ids):
+                                color_id = frame_obj_ids[oid]
+                            else:
+                                color_id = oid
+                            color = torch.tensor(colors[color_id % len(colors)])
                             mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                             vis_frame = vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
                             combined_mask = torch.max(combined_mask, obj_mask)
@@ -1589,7 +1751,12 @@ class SAM3VideoOutput:
                         obj_mask = frame_mask[vis_oid].float()
                         if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
                             obj_mask = obj_mask / 255.0
-                        color = torch.tensor(colors[vis_oid % len(colors)])
+                        # Use stable object ID for color (if available)
+                        if frame_obj_ids is not None and vis_oid < len(frame_obj_ids):
+                            color_id = frame_obj_ids[vis_oid]
+                        else:
+                            color_id = vis_oid
+                        color = torch.tensor(colors[color_id % len(colors)])
                         mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                         vis_frame = vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
                         # Still compute combined for mask output
@@ -1706,6 +1873,9 @@ class SAM3VideoTrim:
                 "scores": ("SAM3_VIDEO_SCORES", {
                     "tooltip": "Confidence scores from SAM3Propagate"
                 }),
+                "obj_ids": ("SAM3_VIDEO_OBJ_IDS", {
+                    "tooltip": "Object IDs from SAM3Propagate (for stable color mapping)"
+                }),
                 "viz_alpha": ("FLOAT", {
                     "default": 0.5,
                     "min": 0.0,
@@ -1721,7 +1891,7 @@ class SAM3VideoTrim:
     FUNCTION = "trim_video"
     CATEGORY = "SAM3/video"
 
-    def trim_video(self, video_frames, masks, track_info, scores=None, viz_alpha=0.5):
+    def trim_video(self, video_frames, masks, track_info, scores=None, obj_ids=None, viz_alpha=0.5):
         """
         Trim video frames and extract masks/visualization for valid frame range.
 
@@ -1793,6 +1963,11 @@ class SAM3VideoTrim:
                 if frame_mask.dim() == 4:
                     frame_mask = frame_mask.squeeze(0)  # Remove batch dim
 
+                # Get object IDs for this frame (for stable color mapping)
+                frame_obj_ids = None
+                if obj_ids is not None and frame_idx in obj_ids:
+                    frame_obj_ids = obj_ids[frame_idx]
+
                 # Check for empty mask
                 if frame_mask.numel() == 0 or (frame_mask.dim() == 3 and frame_mask.shape[0] == 0):
                     combined_mask = torch.zeros(h, w)
@@ -1805,8 +1980,15 @@ class SAM3VideoTrim:
                             obj_mask = obj_mask / 255.0
                         # Add to combined mask
                         combined_mask = torch.max(combined_mask, obj_mask)
+
+                        # Use stable object ID for color (if available), else fall back to array index
+                        if frame_obj_ids is not None and obj_idx < len(frame_obj_ids):
+                            color_id = frame_obj_ids[obj_idx]
+                        else:
+                            color_id = obj_idx
+                        color = torch.tensor(self.COLORS[color_id % len(self.COLORS)])
+
                         # Add colored overlay to visualization
-                        color = torch.tensor(self.COLORS[obj_idx % len(self.COLORS)])
                         mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                         vis_frame = vis_frame * (1 - viz_alpha * obj_mask.unsqueeze(-1)) + viz_alpha * mask_rgb
                 else:
@@ -1816,8 +1998,15 @@ class SAM3VideoTrim:
                     combined_mask = frame_mask.float()
                     if combined_mask.numel() > 0 and combined_mask.max() > 1.0:
                         combined_mask = combined_mask / 255.0
+
+                    # Use stable object ID for color (if available)
+                    if frame_obj_ids is not None and len(frame_obj_ids) > 0:
+                        color_id = frame_obj_ids[0]
+                    else:
+                        color_id = 0
+                    color = torch.tensor(self.COLORS[color_id % len(self.COLORS)])
+
                     # Add colored overlay
-                    color = torch.tensor(self.COLORS[0])
                     mask_rgb = combined_mask.unsqueeze(-1) * color.view(1, 1, 3)
                     vis_frame = vis_frame * (1 - viz_alpha * combined_mask.unsqueeze(-1)) + viz_alpha * mask_rgb
             else:
@@ -2260,6 +2449,7 @@ NODE_CLASS_MAPPINGS = {
     "SAM3Propagate": SAM3Propagate,
     "SAM3VideoOutput": SAM3VideoOutput,
     "SAM3VideoTrim": SAM3VideoTrim,
+    "SAM3VRAMEstimator": SAM3VRAMEstimator,
     "SAM3MaskLoader": SAM3MaskLoader,
     "SAM3MaskToVideo": SAM3MaskToVideo,
 }
@@ -2269,6 +2459,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3Propagate": "SAM3 Propagate",
     "SAM3VideoOutput": "SAM3 Video Output",
     "SAM3VideoTrim": "SAM3 Video Trim",
+    "SAM3VRAMEstimator": "SAM3 VRAM Estimator",
     "SAM3MaskLoader": "SAM3 Mask Loader",
     "SAM3MaskToVideo": "SAM3 Mask to Video",
 }

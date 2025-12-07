@@ -526,6 +526,161 @@ class SAM3VideoSegmentation:
 
 
 # =============================================================================
+# Multi-Frame Prompting
+# =============================================================================
+
+class SAM3AddPrompt:
+    """
+    Add prompts on additional frames to improve tracking.
+
+    Use this to add "correction anchors" on frames where tracking might struggle:
+    - After occlusions (player behind goalie)
+    - After fast motion (collision, quick direction change)
+    - After re-entry (player left and came back)
+
+    Chain multiple SAM3AddPrompt nodes for multiple correction points.
+
+    Example workflow:
+        SAM3VideoSegmentation (frame 0) → SAM3AddPrompt (frame 100) → SAM3AddPrompt (frame 200) → SAM3Propagate
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_state": ("SAM3_VIDEO_STATE", {
+                    "tooltip": "Existing video state with prompts"
+                }),
+                "frame_idx": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "tooltip": "Frame index to add new prompts (different from initial prompts)"
+                }),
+            },
+            "optional": {
+                "positive_points": ("SAM3_POINTS_PROMPT", {
+                    "tooltip": "Positive points to add - click on objects to reinforce tracking"
+                }),
+                "negative_points": ("SAM3_POINTS_PROMPT", {
+                    "tooltip": "Negative points - click on areas to exclude"
+                }),
+                "positive_boxes": ("SAM3_BOXES_PROMPT", {
+                    "tooltip": "Positive boxes - draw around objects to reinforce"
+                }),
+                "obj_id": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "tooltip": "Object ID to reinforce (-1 = auto-assign based on existing objects)"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("SAM3_VIDEO_STATE",)
+    RETURN_NAMES = ("video_state",)
+    FUNCTION = "add_prompt"
+    CATEGORY = "SAM3/video"
+
+    def add_prompt(self, video_state, frame_idx, positive_points=None, negative_points=None,
+                   positive_boxes=None, obj_id=-1):
+        """
+        Add prompts on an additional frame to reinforce tracking.
+
+        Args:
+            video_state: Existing video state with prompts
+            frame_idx: Frame index to add new prompts
+            positive_points: Points to add (from points editor)
+            negative_points: Negative points to exclude
+            positive_boxes: Boxes to add
+            obj_id: Object ID to reinforce (-1 = auto-assign)
+
+        Returns:
+            Updated video_state with new prompts
+        """
+        print(f"[SAM3 AddPrompt] Adding prompts on frame {frame_idx}")
+        print(f"[SAM3 AddPrompt] Existing prompts: {len(video_state.prompts)}")
+
+        # Validate frame_idx
+        if frame_idx >= video_state.num_frames:
+            print(f"[SAM3 AddPrompt] Warning: frame_idx {frame_idx} >= num_frames {video_state.num_frames}")
+            frame_idx = video_state.num_frames - 1
+
+        # Determine starting obj_id
+        if obj_id < 0:
+            # Auto-assign: use next available or match existing
+            existing_ids = video_state.get_object_ids()
+            if existing_ids:
+                obj_id = max(existing_ids)  # Start from highest existing ID
+            else:
+                obj_id = 1
+
+        prompts_added = 0
+
+        # Handle point prompts
+        if positive_points:
+            # Check for multi-object format
+            if positive_points.get("objects"):
+                # Multi-object mode
+                for obj_data in positive_points["objects"]:
+                    current_obj_id = obj_data.get("obj_id", obj_id)
+                    pos_pts = obj_data.get("positive_points", [])
+                    neg_pts = obj_data.get("negative_points", [])
+
+                    all_points = []
+                    all_labels = []
+
+                    for pt in pos_pts:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(1)
+
+                    for pt in neg_pts:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(0)
+
+                    if all_points:
+                        prompt = VideoPrompt.create_point(frame_idx, current_obj_id, all_points, all_labels)
+                        video_state = video_state.with_prompt(prompt)
+                        print(f"[SAM3 AddPrompt] Added point prompt: frame={frame_idx}, obj={current_obj_id}, "
+                              f"positive={len(pos_pts)}, negative={len(neg_pts)}")
+                        prompts_added += 1
+
+            elif positive_points.get("points"):
+                # Legacy single-object mode
+                all_points = []
+                all_labels = []
+
+                for pt in positive_points["points"]:
+                    all_points.append([float(pt[0]), float(pt[1])])
+                    all_labels.append(1)
+
+                if negative_points and negative_points.get("points"):
+                    for pt in negative_points["points"]:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(0)
+
+                if all_points:
+                    prompt = VideoPrompt.create_point(frame_idx, obj_id, all_points, all_labels)
+                    video_state = video_state.with_prompt(prompt)
+                    print(f"[SAM3 AddPrompt] Added point prompt: frame={frame_idx}, obj={obj_id}, "
+                          f"points={len(all_points)}")
+                    prompts_added += 1
+
+        # Handle box prompts
+        if positive_boxes and positive_boxes.get("boxes"):
+            for box in positive_boxes["boxes"]:
+                box_coords = [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
+                prompt = VideoPrompt.create_box(frame_idx, obj_id, box_coords, is_positive=True)
+                video_state = video_state.with_prompt(prompt)
+                print(f"[SAM3 AddPrompt] Added box prompt: frame={frame_idx}, obj={obj_id}")
+                prompts_added += 1
+                obj_id += 1
+
+        print(f"[SAM3 AddPrompt] Total prompts added: {prompts_added}")
+        print(f"[SAM3 AddPrompt] New total prompts: {len(video_state.prompts)}")
+
+        return (video_state,)
+
+
+# =============================================================================
 # Propagation
 # =============================================================================
 
@@ -2473,6 +2628,7 @@ class SAM3MaskToVideo:
 
 NODE_CLASS_MAPPINGS = {
     "SAM3VideoSegmentation": SAM3VideoSegmentation,
+    "SAM3AddPrompt": SAM3AddPrompt,
     "SAM3Propagate": SAM3Propagate,
     "SAM3VideoOutput": SAM3VideoOutput,
     "SAM3VideoTrim": SAM3VideoTrim,
@@ -2483,6 +2639,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3VideoSegmentation": "SAM3 Video Segmentation",
+    "SAM3AddPrompt": "SAM3 Add Prompt",
     "SAM3Propagate": "SAM3 Propagate",
     "SAM3VideoOutput": "SAM3 Video Output",
     "SAM3VideoTrim": "SAM3 Video Trim",

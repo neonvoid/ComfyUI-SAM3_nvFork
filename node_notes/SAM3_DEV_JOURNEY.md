@@ -253,6 +253,57 @@ color = COLORS[color_id % len(COLORS)]
 
 ---
 
+### Phase 6: Multi-Frame Prompting (SAM3AddPrompt)
+
+**Purpose**: Add prompts on additional frames to improve tracking through challenging scenarios.
+
+**Problem solved**: SAM3 can lose track of objects through:
+- Occlusions (player behind goalie)
+- Fast motion (collisions, quick direction changes)
+- Similar appearances (same team uniforms)
+- Frame exits/entries
+
+**New Node**: `SAM3AddPrompt`
+
+**Inputs**:
+| Input | Type | Description |
+|-------|------|-------------|
+| `video_state` | SAM3_VIDEO_STATE | Existing state with prompts |
+| `frame_idx` | INT | Frame to add correction prompts |
+| `positive_points` | SAM3_POINTS_PROMPT | Points to reinforce tracking |
+| `negative_points` | SAM3_POINTS_PROMPT | Points to exclude |
+| `positive_boxes` | SAM3_BOXES_PROMPT | Boxes to reinforce |
+| `obj_id` | INT | Object ID to reinforce (-1 = auto) |
+
+**Workflow**:
+```
+SAM3VideoSegmentation (frame 0, select 5 players)
+        ↓
+    video_state
+        ↓
+SAM3AddPrompt (frame 100, re-click player 3 after occlusion)
+        ↓
+    video_state (2 prompt sets)
+        ↓
+SAM3AddPrompt (frame 200, re-click player 1 after collision)
+        ↓
+    video_state (3 prompt sets)
+        ↓
+SAM3Propagate (all prompts applied during propagation)
+```
+
+**Use Cases for Hockey**:
+| Scenario | When to Add Prompt |
+|----------|-------------------|
+| Player behind goalie | After they emerge from occlusion |
+| Board collision/pile-up | After players separate |
+| Line change | When new players enter |
+| Camera angle change | Help re-identify from new angle |
+
+**Location**: `nodes/sam3_video_nodes.py` SAM3AddPrompt class
+
+---
+
 ## Architecture Notes
 
 ### Data Flow
@@ -366,7 +417,7 @@ To test early exit feature:
 
 | File | Key Classes/Functions |
 |------|----------------------|
-| `nodes/sam3_video_nodes.py` | SAM3VideoSegmentation, SAM3Propagate, SAM3VideoOutput, SAM3VideoTrim, SAM3VRAMEstimator |
+| `nodes/sam3_video_nodes.py` | SAM3VideoSegmentation, SAM3AddPrompt, SAM3Propagate, SAM3VideoOutput, SAM3VideoTrim, SAM3VRAMEstimator |
 | `nodes/sam3_mask_tracks.py` | SAM3MaskTracks, SAM3BatchPlanner, SAM3VideoSegmenter |
 | `nodes/sam3_lib/sam3_video_predictor.py` | Sam3VideoPredictor wrapper |
 | `nodes/sam3_lib/model/sam3_video_inference.py` | Core model, `propagate_in_video()` |

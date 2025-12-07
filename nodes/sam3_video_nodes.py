@@ -1408,18 +1408,25 @@ class SAM3Propagate:
                             mask = outputs[mask_key]
                             if hasattr(mask, 'cpu'):
                                 mask = mask.cpu()
-                            masks_dict[frame_idx] = mask
                             del outputs[mask_key]
 
                             # Capture object IDs for stable color mapping
+                            frame_obj_ids = None
                             if "obj_ids" in outputs and outputs["obj_ids"] is not None:
                                 ids = outputs["obj_ids"]
                                 if hasattr(ids, 'tolist'):
                                     ids = ids.tolist()
                                 elif isinstance(ids, np.ndarray):
                                     ids = ids.tolist()
+                                frame_obj_ids = ids
                                 obj_ids_dict[frame_idx] = ids
                                 del outputs["obj_ids"]
+
+                            # Bundle mask and obj_ids together for automatic color stability
+                            masks_dict[frame_idx] = {
+                                "mask": mask,
+                                "obj_ids": frame_obj_ids
+                            }
 
                             # Early exit: check if mask is empty (all objects left frame)
                             if auto_exit_on_empty:
@@ -1703,7 +1710,16 @@ class SAM3VideoOutput:
 
             # Get mask for this frame
             if frame_idx in masks:
-                frame_mask = masks[frame_idx]
+                mask_data = masks[frame_idx]
+
+                # Check if mask_data is bundled (dict with mask+obj_ids) or legacy (just tensor)
+                if isinstance(mask_data, dict):
+                    frame_mask = mask_data.get("mask")
+                    embedded_obj_ids = mask_data.get("obj_ids")
+                else:
+                    # Legacy format: just the mask tensor
+                    frame_mask = mask_data
+                    embedded_obj_ids = None
 
                 # Convert numpy to torch if needed
                 if isinstance(frame_mask, np.ndarray):
@@ -1716,9 +1732,10 @@ class SAM3VideoOutput:
                 # Create visualization with colored overlays
                 vis_frame = img_tensor.clone()
 
-                # Get object IDs for this frame (for stable color mapping)
-                frame_obj_ids = None
-                if obj_ids is not None and frame_idx in obj_ids:
+                # Get object IDs for stable color mapping
+                # Priority: embedded obj_ids > separate obj_ids input > array index fallback
+                frame_obj_ids = embedded_obj_ids
+                if frame_obj_ids is None and obj_ids is not None and frame_idx in obj_ids:
                     frame_obj_ids = obj_ids[frame_idx]
 
                 # Check for empty mask (no detections)
@@ -1953,7 +1970,16 @@ class SAM3VideoTrim:
 
             # Get mask for this frame
             if frame_idx in masks:
-                frame_mask = masks[frame_idx]
+                mask_data = masks[frame_idx]
+
+                # Check if mask_data is bundled (dict with mask+obj_ids) or legacy (just tensor)
+                if isinstance(mask_data, dict):
+                    frame_mask = mask_data.get("mask")
+                    embedded_obj_ids = mask_data.get("obj_ids")
+                else:
+                    # Legacy format: just the mask tensor
+                    frame_mask = mask_data
+                    embedded_obj_ids = None
 
                 # Convert numpy to torch if needed
                 if isinstance(frame_mask, np.ndarray):
@@ -1963,9 +1989,10 @@ class SAM3VideoTrim:
                 if frame_mask.dim() == 4:
                     frame_mask = frame_mask.squeeze(0)  # Remove batch dim
 
-                # Get object IDs for this frame (for stable color mapping)
-                frame_obj_ids = None
-                if obj_ids is not None and frame_idx in obj_ids:
+                # Get object IDs for stable color mapping
+                # Priority: embedded obj_ids > separate obj_ids input > array index fallback
+                frame_obj_ids = embedded_obj_ids
+                if frame_obj_ids is None and obj_ids is not None and frame_idx in obj_ids:
                     frame_obj_ids = obj_ids[frame_idx]
 
                 # Check for empty mask

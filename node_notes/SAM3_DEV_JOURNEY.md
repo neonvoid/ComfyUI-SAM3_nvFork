@@ -206,24 +206,37 @@ Frame 101: objects [1,3,4] at indices [0,1,2] → colors [blue,red,green]
            Object 3 now has index 1 → gets RED instead of GREEN!
 ```
 
-**Fix**: Store and use stable object IDs for color mapping.
+**Fix**: Bundle obj_ids inside masks_dict for automatic color stability.
 
-**Step 1**: Capture `obj_ids` during propagation:
+**Implementation**:
+
+**Step 1**: Bundle obj_ids with mask during propagation:
 ```python
 # In SAM3Propagate.propagate()
-if "obj_ids" in outputs:
-    obj_ids_dict[frame_idx] = outputs["obj_ids"].tolist()
+masks_dict[frame_idx] = {
+    "mask": mask,
+    "obj_ids": frame_obj_ids  # Bundled for automatic color stability
+}
 ```
 
-**Step 2**: New output type `SAM3_VIDEO_OBJ_IDS`:
-```python
-RETURN_TYPES = (..., "SAM3_VIDEO_OBJ_IDS")
-RETURN_NAMES = (..., "obj_ids")
-```
-
-**Step 3**: Use stable IDs for color in visualization:
+**Step 2**: Unpack bundled data in visualization nodes:
 ```python
 # In SAM3VideoTrim and SAM3VideoOutput
+mask_data = masks[frame_idx]
+if isinstance(mask_data, dict):
+    frame_mask = mask_data.get("mask")
+    embedded_obj_ids = mask_data.get("obj_ids")
+else:
+    # Legacy format support
+    frame_mask = mask_data
+    embedded_obj_ids = None
+
+# Use embedded obj_ids for stable colors
+frame_obj_ids = embedded_obj_ids
+```
+
+**Step 3**: Use stable IDs for color:
+```python
 if frame_obj_ids is not None and obj_idx < len(frame_obj_ids):
     color_id = frame_obj_ids[obj_idx]  # Use stable ID
 else:
@@ -231,10 +244,12 @@ else:
 color = COLORS[color_id % len(COLORS)]
 ```
 
+**Benefit**: No manual wiring needed - colors are automatically stable!
+
 **Locations**:
-- `SAM3Propagate.propagate()` - Store obj_ids
-- `SAM3VideoTrim._create_visualization()` - Use obj_ids for colors
-- `SAM3VideoOutput.extract()` - Use obj_ids for colors
+- `SAM3Propagate.propagate()` - Bundle obj_ids inside masks_dict
+- `SAM3VideoTrim.trim_video()` - Unpack and use embedded obj_ids
+- `SAM3VideoOutput.extract()` - Unpack and use embedded obj_ids
 
 ---
 

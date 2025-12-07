@@ -12,6 +12,7 @@ Key design principles:
 5. No manual SAM3CloseVideoSession needed
 """
 import gc
+import json
 import torch
 import numpy as np
 from pathlib import Path

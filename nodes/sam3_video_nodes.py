@@ -1660,6 +1660,86 @@ class SAM3VideoOutput:
 
 
 # =============================================================================
+# Video Trimming (for early exit workflow)
+# =============================================================================
+
+class SAM3VideoTrim:
+    """
+    Trim video frames based on track_info from SAM3Propagate.
+
+    Use this after SAM3Propagate with auto_exit_on_empty=True to trim
+    the original video frames to match the truncated mask output.
+
+    This allows the downstream workflow to have matching frame counts
+    between video and masks.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_frames": ("IMAGE", {
+                    "tooltip": "Original video frames [N, H, W, C]"
+                }),
+                "track_info": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "JSON track info from SAM3Propagate (with early exit metadata)"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT")
+    RETURN_NAMES = ("trimmed_frames", "start_frame", "end_frame", "total_frames")
+    FUNCTION = "trim_video"
+    CATEGORY = "SAM3/video"
+
+    def trim_video(self, video_frames, track_info):
+        """
+        Trim video frames to match the valid frame range from early exit.
+
+        Args:
+            video_frames: Original video frames [N, H, W, C]
+            track_info: JSON string with early exit metadata
+
+        Returns:
+            trimmed_frames: Sliced video frames
+            start_frame: Start frame index
+            end_frame: End frame index (inclusive)
+            total_frames: Number of frames in output
+        """
+        # Parse track_info JSON
+        try:
+            info = json.loads(track_info)
+        except json.JSONDecodeError as e:
+            print(f"[SAM3 VideoTrim] Error parsing track_info JSON: {e}")
+            print(f"[SAM3 VideoTrim] Returning original frames unchanged")
+            return (video_frames, 0, video_frames.shape[0] - 1, video_frames.shape[0])
+
+        # Extract frame range
+        start_frame = info.get("start_frame", 0)
+        last_valid_frame = info.get("last_valid_frame", video_frames.shape[0] - 1)
+        early_exit_triggered = info.get("early_exit_triggered", False)
+
+        # Validate frame range
+        num_input_frames = video_frames.shape[0]
+        start_frame = max(0, min(start_frame, num_input_frames - 1))
+        end_frame = max(start_frame, min(last_valid_frame, num_input_frames - 1))
+
+        # Slice video frames
+        trimmed = video_frames[start_frame:end_frame + 1]
+        total_frames = trimmed.shape[0]
+
+        if early_exit_triggered:
+            print(f"[SAM3 VideoTrim] Early exit detected - trimming video")
+            print(f"[SAM3 VideoTrim] Original: {num_input_frames} frames")
+            print(f"[SAM3 VideoTrim] Trimmed: frames {start_frame}-{end_frame} ({total_frames} frames)")
+        else:
+            print(f"[SAM3 VideoTrim] No early exit - frames {start_frame}-{end_frame} ({total_frames} frames)")
+
+        return (trimmed, start_frame, end_frame, total_frames)
+
+
+# =============================================================================
 # Mask Loading (for streaming mode)
 # =============================================================================
 
@@ -2082,6 +2162,7 @@ NODE_CLASS_MAPPINGS = {
     "SAM3VideoSegmentation": SAM3VideoSegmentation,
     "SAM3Propagate": SAM3Propagate,
     "SAM3VideoOutput": SAM3VideoOutput,
+    "SAM3VideoTrim": SAM3VideoTrim,
     "SAM3MaskLoader": SAM3MaskLoader,
     "SAM3MaskToVideo": SAM3MaskToVideo,
 }
@@ -2090,6 +2171,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3VideoSegmentation": "SAM3 Video Segmentation",
     "SAM3Propagate": "SAM3 Propagate",
     "SAM3VideoOutput": "SAM3 Video Output",
+    "SAM3VideoTrim": "SAM3 Video Trim",
     "SAM3MaskLoader": "SAM3 Mask Loader",
     "SAM3MaskToVideo": "SAM3 Mask to Video",
 }

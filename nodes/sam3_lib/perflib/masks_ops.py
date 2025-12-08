@@ -48,6 +48,7 @@ def masks_to_boxes(masks: torch.Tensor, obj_ids: list[int]):
 def mask_iou(pred_masks: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
     """
     Compute the IoU (Intersection over Union) between predicted masks and ground truth masks.
+    Uses batched computation for large inputs to prevent OOM.
     Args:
       - pred_masks: (N, H, W) bool Tensor, containing binary predicted segmentation masks
       - gt_masks: (M, H, W) bool Tensor, containing binary ground truth segmentation masks
@@ -58,12 +59,28 @@ def mask_iou(pred_masks: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
     N, H, W = pred_masks.shape
     M, _, _ = gt_masks.shape
 
-    # Flatten masks: (N, 1, H*W) and (1, M, H*W)
-    pred_flat = pred_masks.view(N, 1, H * W)
-    gt_flat = gt_masks.view(1, M, H * W)
+    # Estimate memory usage: N * M * H * W elements for broadcasting
+    estimated_elements = N * M * H * W
 
-    # Compute intersection and union: (N, M)
-    intersection = (pred_flat & gt_flat).sum(dim=2).float()
-    union = (pred_flat | gt_flat).sum(dim=2).float()
-    ious = intersection / union.clamp(min=1)
+    # If small enough (<100M elements), use fast vectorized approach
+    if estimated_elements < 100_000_000:
+        pred_flat = pred_masks.view(N, 1, H * W)
+        gt_flat = gt_masks.view(1, M, H * W)
+        intersection = (pred_flat & gt_flat).sum(dim=2).float()
+        union = (pred_flat | gt_flat).sum(dim=2).float()
+        return intersection / union.clamp(min=1)
+
+    # Batched computation for large inputs to prevent OOM
+    batch_size = max(1, 100_000_000 // (M * H * W))  # Aim for ~100M elements per batch
+    ious = torch.zeros(N, M, device=pred_masks.device, dtype=torch.float)
+
+    for i in range(0, N, batch_size):
+        i_end = min(i + batch_size, N)
+        pred_batch = pred_masks[i:i_end].view(i_end - i, 1, H * W)
+        gt_flat = gt_masks.view(1, M, H * W)
+
+        intersection = (pred_batch & gt_flat).sum(dim=2).float()
+        union = (pred_batch | gt_flat).sum(dim=2).float()
+        ious[i:i_end] = intersection / union.clamp(min=1)
+
     return ious  # shape: (N, M)

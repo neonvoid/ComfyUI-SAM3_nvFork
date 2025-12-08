@@ -437,7 +437,8 @@ def build_tracker(
     # Create the Tracker module
     model = Sam3TrackerPredictor(
         image_size=1008,
-        num_maskmem=7,
+        num_maskmem=4,  # Reduced from 7 to save VRAM with many objects
+        max_obj_ptrs_in_encoder=8,  # Reduced from 16 to save VRAM with many objects
         backbone=backbone,
         backbone_stride=14,
         transformer=transformer,

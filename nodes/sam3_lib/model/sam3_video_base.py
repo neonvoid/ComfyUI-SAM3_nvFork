@@ -396,8 +396,11 @@ class Sam3VideoBase(nn.Module):
             input_batch.img_batch[frame_idx],
             backbone_cache,
         )
-        # remove from `feature_cache` old features to save GPU memory
-        feature_cache.pop(frame_idx - 1 if not reverse else frame_idx + 1, None)
+        # Aggressive cleanup: remove ALL frames outside 2-frame window to prevent OOM on long videos
+        frames_to_remove = [f for f in feature_cache.keys()
+                          if isinstance(f, int) and abs(f - frame_idx) > 2]
+        for f in frames_to_remove:
+            feature_cache.pop(f, None)
         return det_out
 
     def run_tracker_propagation(

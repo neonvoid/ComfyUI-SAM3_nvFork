@@ -353,6 +353,69 @@ trim_past_non_cond_mem_for_eval=True  # Was False
 
 ---
 
+### Phase 8: Stop/Cancel Support
+
+**Problem**: Pressing ComfyUI's stop button during SAM3 processing had no effect - nodes would continue processing until completion.
+
+**Root Cause**: Long-running loops didn't check ComfyUI's interrupt flag.
+
+**Solution**: Add `comfy.model_management.throw_exception_if_processing_interrupted()` at the start of each major loop iteration.
+
+**ComfyUI Interrupt Mechanism**:
+- User clicks Cancel → sets global `interrupt_processing = True`
+- `throw_exception_if_processing_interrupted()` raises `InterruptProcessingException`
+- Exception propagates to ComfyUI's execution handler for graceful stop
+
+**Loops Updated** (in `nodes/sam3_video_nodes.py`):
+
+| Method | Loop Purpose |
+|--------|--------------|
+| `_propagate_chunk()` | Chunk streaming inference |
+| `_propagate_range_detection()` | Range detection inference |
+| `_propagate_streaming()` | Stream-to-disk inference |
+| `propagate()` | Standard propagation |
+| `SAM3VideoOutput.extract()` | Frame visualization |
+| `SAM3MaskToVideo` | Mask-to-video conversion |
+
+**Location**: `nodes/sam3_video_nodes.py` - 6 lines added
+
+---
+
+### Phase 9: Feature Cache Memory Optimization
+
+**Problem**: OOM still occurring at frame 1214/1454 despite Phase 7 memory trimming. VRAM grew from 42.55GB to 46GB.
+
+**Root Cause**: Phase 7 fixed the **memory bank** but OOM was happening in **feature cache** (`_prepare_backbone_feats`). The feature cache cleanup only removed 1 previous frame - not aggressive enough for 1400+ frame videos.
+
+**Changes Made**:
+
+1. **Enable CPU offloading** - `model_builder.py:460`
+```python
+offload_output_to_cpu_for_eval=True,  # Was False
+```
+Moves mask outputs to CPU RAM instead of VRAM. No quality impact, slight speed reduction.
+
+2. **Aggressive feature cache cleanup** - `sam3_video_base.py:400`
+```python
+# OLD: only removes 1 previous frame
+feature_cache.pop(frame_idx - 1 if not reverse else frame_idx + 1, None)
+
+# NEW: remove ALL frames outside 2-frame window
+frames_to_remove = [f for f in feature_cache.keys()
+                   if isinstance(f, int) and abs(f - frame_idx) > 2]
+for f in frames_to_remove:
+    feature_cache.pop(f, None)
+```
+SAM3 only needs current frame's backbone features. Old frames lingering was a memory leak.
+
+**Quality Impact**: None. SAM3 uses memory bank for tracking, not feature cache. Feature cache is just temporary backbone computation.
+
+**Locations**:
+- `nodes/sam3_lib/model_builder.py` line 460
+- `nodes/sam3_lib/model/sam3_video_base.py` line 400
+
+---
+
 ## Architecture Notes
 
 ### Data Flow

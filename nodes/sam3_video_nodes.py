@@ -954,6 +954,7 @@ class SAM3Propagate:
 
                 try:
                     for response in sam3_model.handle_stream_request(request):
+                        comfy.model_management.throw_exception_if_processing_interrupted()
                         frame_idx = response.get("frame_index", response.get("frame_idx"))
                         if frame_idx is None:
                             continue
@@ -1117,6 +1118,7 @@ class SAM3Propagate:
 
             try:
                 for response in sam3_model.handle_stream_request(request):
+                    comfy.model_management.throw_exception_if_processing_interrupted()
                     frame_idx = response.get("frame_index", response.get("frame_idx"))
                     if frame_idx is None:
                         continue
@@ -1324,6 +1326,7 @@ class SAM3Propagate:
 
             try:
                 for response in sam3_model.handle_stream_request(request):
+                    comfy.model_management.throw_exception_if_processing_interrupted()
                     frame_idx = response.get("frame_index", response.get("frame_idx"))
                     if frame_idx is None:
                         continue
@@ -1544,6 +1547,7 @@ class SAM3Propagate:
                 # Run propagation
                 try:
                     for response in sam3_model.handle_stream_request(request):
+                        comfy.model_management.throw_exception_if_processing_interrupted()
                         frame_idx = response.get("frame_index", response.get("frame_idx"))
                         if frame_idx is None:
                             continue
@@ -1852,6 +1856,7 @@ class SAM3VideoOutput:
         num_objects = 0
 
         for frame_idx in range(num_frames):
+            comfy.model_management.throw_exception_if_processing_interrupted()
             # Load original frame
             frame_path = os.path.join(video_state.temp_dir, f"{frame_idx:05d}.jpg")
             if os.path.exists(frame_path):
@@ -2549,6 +2554,7 @@ class SAM3MaskToVideo:
 
         # Process one frame at a time (memory efficient)
         for frame_idx in range(actual_start, actual_end + 1):
+            comfy.model_management.throw_exception_if_processing_interrupted()
             frame = video_frames[frame_idx]
             h, w = frame.shape[:2]
 

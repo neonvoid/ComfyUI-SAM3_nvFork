@@ -430,6 +430,42 @@ trimmed_out = {
 
 ---
 
+### Phase 9.1: Fix OOM with Many Objects (AutoTrack Regression)
+
+**Problem**: OOM at frame 571/1000 when tracking 20 objects from AutoTrack.
+
+**Root Cause**: Phase 9 introduced a regression! Enabling `offload_output_to_cpu_for_eval=True` broke the far-old-frame cleanup logic.
+
+In `sam3_tracker_base.py:1104-1106`:
+```python
+# BEFORE (broken condition):
+if (
+    self.use_memory_selection and not self.offload_output_to_cpu_for_eval
+):  ## design for memory selection, trim too old frames to save memory
+```
+
+When `offload_output_to_cpu_for_eval=True` (set in Phase 9), this condition is ALWAYS `False`, so the far-old-frame cleanup at `frame_idx - 20 * max_obj_ptrs_in_encoder` (320 frames back) is **completely skipped**.
+
+**Fix**: Remove the `not self.offload_output_to_cpu_for_eval` check:
+```python
+# AFTER:
+if self.use_memory_selection:
+    # Trim very old frames regardless of CPU offloading to prevent OOM
+```
+
+This ensures old frames are still cleaned up even with CPU offloading enabled.
+
+**Why Memory Scales with Objects**: With 20 tracked objects:
+- Each frame stores 20× mask data
+- `non_cond_frame_outputs` grows much faster
+- Without far-old-frame cleanup, memory accumulates until OOM
+
+**Location**: `nodes/sam3_lib/model/sam3_tracker_base.py` line 1104-1105
+
+**Tip**: AutoTrack has a `max_objects` parameter (default -1 = unlimited). For memory-constrained setups, consider limiting to 10-15 objects.
+
+---
+
 ## Architecture Notes
 
 ### Data Flow

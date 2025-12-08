@@ -1101,9 +1101,8 @@ class Sam3TrackerBase(torch.nn.Module):
                         _trim_past_out(past_out, current_out)
                     )
 
-            if (
-                self.use_memory_selection and not self.offload_output_to_cpu_for_eval
-            ):  ## design for memory selection, trim too old frames to save memory
+            if self.use_memory_selection:
+                # Trim very old frames regardless of CPU offloading to prevent OOM
                 far_old_frame_idx = frame_idx - 20 * self.max_obj_ptrs_in_encoder
                 past_out = output_dict["non_cond_frame_outputs"].get(
                     far_old_frame_idx, None

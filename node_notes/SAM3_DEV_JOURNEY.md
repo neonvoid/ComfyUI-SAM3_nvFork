@@ -532,6 +532,83 @@ def cal_mem_score(self, object_score_logits, iou_score):
 
 ---
 
+### Phase 10.2: Batched NMS IoU (OOM Prevention)
+
+**Problem**: OOM at frame 78 in detector's NMS when continuous detection creates many candidates:
+```
+torch.OutOfMemoryError: Allocation on device
+  File "perflib/masks_ops.py", line 66, in mask_iou
+```
+
+**Root Cause**: `mask_iou` creates a massive N×M×(H×W) tensor for pairwise IoU computation. With 100 candidates × 100 candidates × 1M pixels = **10 billion elements** → OOM.
+
+**Fix**: Batched computation when tensor size exceeds threshold:
+```python
+def mask_iou(pred_masks, gt_masks):
+    estimated_elements = N * M * H * W
+
+    # Fast path for small inputs
+    if estimated_elements < 100_000_000:
+        return vectorized_iou(pred_masks, gt_masks)
+
+    # Batched path for large inputs
+    batch_size = max(1, 100_000_000 // (M * H * W))
+    for i in range(0, N, batch_size):
+        # Process in chunks...
+```
+
+**Impact**: Prevents NMS OOM, ~2-3x slower for large inputs, no quality impact.
+
+**Location**: `nodes/sam3_lib/perflib/masks_ops.py` lines 48-86
+
+---
+
+### Phase 10.3: Reduced Memory Defaults (OOM Prevention)
+
+**Problem**: OOM at frame 233 in transformer cross-attention when tracking 10-11+ objects:
+```
+torch.OutOfMemoryError: Allocation on device
+  File "sam/rope.py", line 78, in apply_rotary_enc
+```
+
+**Root Cause**: Continuous detection allows unlimited objects. Each object adds:
+- `num_maskmem=7` mask memory frames
+- `max_obj_ptrs_in_encoder=16` object pointers in attention
+
+With 11 objects: 77 memory entries + 176 object pointers → attention OOM.
+
+**Fix**: Reduced memory defaults in model builder:
+```python
+num_maskmem=4,              # Was 7 - fewer memory frames per object
+max_obj_ptrs_in_encoder=8,  # Was 16 - fewer object pointers
+```
+
+**Impact**: ~40% memory reduction, minor quality impact (less temporal context per object).
+
+**Note**: This is a band-aid fix. The proper solution is to enforce `max_objects` in continuous detection mode (Phase 11 TODO).
+
+**Location**: `nodes/sam3_lib/model_builder.py` lines 440-441
+
+---
+
+## Phase 11 TODO: Proper Object Limiting
+
+**Problem**: Continuous detection mode ignores the `max_objects` parameter, leading to unbounded object tracking and eventual OOM.
+
+**Current State**:
+- AutoTrack has `max_objects` parameter (default -1 = unlimited)
+- When `continuous_detection=True`, we use text prompts
+- SAM3's text detection has no object limit enforcement
+
+**Proper Fix**:
+1. After each detection frame, count tracked objects
+2. If exceeds `max_objects`, remove lowest-confidence objects
+3. Or configure SAM3's internal detection limit
+
+**Trade-off**: Phase 10.3 (reduced memory) is a quick fix that works but may reduce tracking quality. Phase 11 would be the proper long-term solution.
+
+---
+
 ## Architecture Notes
 
 ### Data Flow

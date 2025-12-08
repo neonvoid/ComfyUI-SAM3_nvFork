@@ -408,11 +408,25 @@ for f in frames_to_remove:
 ```
 SAM3 only needs current frame's backbone features. Old frames lingering was a memory leak.
 
+3. **Fix CPU offload bug** - `sam3_tracker_base.py:1059-1068`
+
+When `offload_output_to_cpu_for_eval=True`, the `trimmed_out` dict was missing `maskmem_features` and `maskmem_pos_enc` keys when `run_mem_encoder=False`, causing KeyError in `sam3_tracking_predictor.py:1113`.
+
+```python
+# Added default None values to trimmed_out:
+trimmed_out = {
+    ...
+    "maskmem_features": None,  # ADDED
+    "maskmem_pos_enc": None,   # ADDED
+}
+```
+
 **Quality Impact**: None. SAM3 uses memory bank for tracking, not feature cache. Feature cache is just temporary backbone computation.
 
 **Locations**:
 - `nodes/sam3_lib/model_builder.py` line 460
 - `nodes/sam3_lib/model/sam3_video_base.py` line 400
+- `nodes/sam3_lib/model/sam3_tracker_base.py` line 1065-1068
 
 ---
 

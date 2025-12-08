@@ -1062,6 +1062,9 @@ class Sam3TrackerBase(torch.nn.Module):
                 # other items for evaluation (these are small tensors so we keep them on GPU)
                 "obj_ptr": current_out["obj_ptr"],
                 "object_score_logits": current_out["object_score_logits"],
+                # Always include maskmem keys (may be None if run_mem_encoder=False)
+                "maskmem_features": None,
+                "maskmem_pos_enc": None,
             }
             if run_mem_encoder and self.num_maskmem > 0:
                 trimmed_out["maskmem_features"] = maskmem_features.cpu()

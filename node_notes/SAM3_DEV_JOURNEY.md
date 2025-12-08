@@ -505,6 +505,33 @@ This sets `inference_state["text_prompt"]` which makes `has_text_prompt=True` fo
 
 ---
 
+### Phase 10.1: Fix Device Mismatch in cal_mem_score
+
+**Problem**: RuntimeError during propagation with text prompts:
+```
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!
+```
+
+**Root Cause**: Phase 9's CPU offloading moves some tensors to CPU via `trimmed_out.cpu()`. When `remove_object` is called during propagation (to remove low-confidence detections), `cal_mem_score` tries to multiply `object_score_logits` (on CPU) with `iou_score` (on GPU).
+
+**Call path**:
+1. `sam3_video_base.py:937` - `_tracker_remove_objects()` called
+2. `sam3_tracking_predictor.py:1286` - `_slice_state` calls `cal_mem_score()`
+3. `sam3_tracker_base.py:522` - tensor multiplication fails
+
+**Fix**: Ensure both tensors are on the same device before multiplication:
+```python
+def cal_mem_score(self, object_score_logits, iou_score):
+    # Ensure tensors are on the same device (handle CPU offloading)
+    device = object_score_logits.device
+    iou_score = iou_score.to(device)
+    ...
+```
+
+**Location**: `nodes/sam3_lib/model/sam3_tracker_base.py` line 516-519
+
+---
+
 ## Architecture Notes
 
 ### Data Flow

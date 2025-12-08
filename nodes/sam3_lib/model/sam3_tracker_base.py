@@ -514,6 +514,10 @@ class Sam3TrackerBase(torch.nn.Module):
         return image, vision_feats, vision_pos_embeds, feat_sizes
 
     def cal_mem_score(self, object_score_logits, iou_score):
+        # Ensure tensors are on the same device (handle CPU offloading)
+        device = object_score_logits.device
+        iou_score = iou_score.to(device)
+
         object_score_norm = torch.where(
             object_score_logits > 0,
             object_score_logits.sigmoid() * 2 - 1,  ## rescale to [0, 1]

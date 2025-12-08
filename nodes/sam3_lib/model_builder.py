@@ -446,7 +446,7 @@ def build_tracker(
         multimask_output_in_sam=True,
         # Evaluation
         forward_backbone_per_frame_for_eval=True,
-        trim_past_non_cond_mem_for_eval=False,
+        trim_past_non_cond_mem_for_eval=True,  # Enable memory cleanup for long videos
         # Multimask
         multimask_output_for_tracking=True,
         multimask_min_pt_num=0,

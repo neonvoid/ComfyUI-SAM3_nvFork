@@ -304,6 +304,55 @@ SAM3Propagate (all prompts applied during propagation)
 
 ---
 
+### Phase 7: Memory Optimization (Trimming)
+
+**Problem**: SAM3's memory grows unboundedly during long video propagation, causing OOM.
+
+**Investigation**: Compared nvFork settings to Meta SAM3 defaults:
+
+| Setting | Meta SAM3 | nvFork | Effect |
+|---------|-----------|--------|--------|
+| `num_maskmem` | 7 | 7 | 7-frame sliding window |
+| `max_cond_frames_in_attn` | -1 (unlimited) | **4** | nvFork already optimized! |
+| `trim_past_non_cond_mem_for_eval` | False | False→**True** | Now trimming old frames |
+| `offload_output_to_cpu_for_eval` | False | False | Keep on GPU for speed |
+
+**Key Insight**: The nvFork author already optimized `max_cond_frames_in_attn` from unlimited to 4. But `trim` was left off.
+
+**What Trimming Does**:
+```
+WITHOUT trim (memory grows forever):
+Frame 600 memory: [0, 1, 2, 3, ... 598, 599, 600]  ← 600+ frames!
+
+WITH trim (bounded memory):
+Frame 600 memory: [0, 100, 300] + [594-600]  ← Only anchors + 7-frame window!
+                   ↑ conditioning frames (your prompts - KEPT)
+                              ↑ recent 7 frames (KEPT)
+```
+
+**How Prompts Create Anchors**:
+- SAM3AddPrompt on frame 100 → Frame 100 = conditioning frame (KEPT)
+- SAM3AddPrompt on frame 300 → Frame 300 = conditioning frame (KEPT)
+- Everything else beyond 7-frame window → DELETED
+
+**Memory Savings**: ~1GB+ for 600-frame videos
+
+**Change Made**:
+```python
+# model_builder.py line 449
+trim_past_non_cond_mem_for_eval=True  # Was False
+```
+
+**Synergy with SAM3AddPrompt**:
+1. Trimming cleans up old non-conditioning frames
+2. SAM3AddPrompt creates conditioning frames (anchors)
+3. Anchors survive trimming, providing recovery points
+4. Perfect for hockey: add prompts after occlusions, line changes, etc.
+
+**Location**: `nodes/sam3_lib/model_builder.py` line 449
+
+---
+
 ## Architecture Notes
 
 ### Data Flow

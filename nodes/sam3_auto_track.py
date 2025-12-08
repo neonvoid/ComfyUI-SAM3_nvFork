@@ -138,7 +138,11 @@ class SAM3AutoTrack:
                     "min": -1,
                     "max": 100,
                     "step": 1,
-                    "tooltip": "Maximum total objects to track (-1 for unlimited)"
+                    "tooltip": "Maximum total objects to track (-1 for unlimited). Only applies in keyframe mode."
+                }),
+                "continuous_detection": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "If True, uses SAM3's native text detection on EVERY frame (detects new objects entering scene). If False, only detects at keyframe intervals (faster, but may miss objects entering later)."
                 }),
                 "score_threshold": ("FLOAT", {
                     "default": 0.3,
@@ -213,10 +217,19 @@ class SAM3AutoTrack:
     def auto_track(self, sam3_model, video_frames, text_prompt: str,
                    keyframe_interval: int = 30, confidence_threshold: float = 0.2,
                    iou_threshold: float = 0.3, max_objects: int = -1,
+                   continuous_detection: bool = True,
                    score_threshold: float = 0.3, offload_model: bool = False,
                    offload_video_to_cpu: bool = True, offload_state_to_cpu: bool = False):
         """
         Perform automatic multi-instance detection and tracking setup.
+
+        Two modes:
+        - continuous_detection=True (default): Uses SAM3's native text prompt detection.
+          SAM3 runs detection on EVERY frame during propagation, automatically detecting
+          and tracking all objects matching the text prompt including those entering later.
+
+        - continuous_detection=False: Pre-detects at keyframe intervals using grounding,
+          then creates box prompts. Faster but may miss objects entering between keyframes.
         """
         # Load model to GPU
         comfy.model_management.load_models_gpu([sam3_model])
@@ -234,9 +247,7 @@ class SAM3AutoTrack:
         print(f"[SAM3 AutoTrack] Starting auto-tracking")
         print(f"[SAM3 AutoTrack]   Video: {num_frames} frames, {width}x{height}")
         print(f"[SAM3 AutoTrack]   Text prompt: '{text_prompt}'")
-        print(f"[SAM3 AutoTrack]   Keyframe interval: {keyframe_interval}")
-        print(f"[SAM3 AutoTrack]   Confidence threshold: {confidence_threshold}")
-        print(f"[SAM3 AutoTrack]   IoU threshold: {iou_threshold}")
+        print(f"[SAM3 AutoTrack]   Mode: {'CONTINUOUS (every frame)' if continuous_detection else f'KEYFRAME (every {keyframe_interval} frames)'}")
         print(f"[SAM3 AutoTrack]   Memory offload: video={offload_video_to_cpu}, state={offload_state_to_cpu}")
 
         # 1. Create video state
@@ -246,6 +257,47 @@ class SAM3AutoTrack:
             offload_state_to_cpu=offload_state_to_cpu,
         )
         video_state = create_video_state(video_frames, config=config)
+
+        # ==========================================
+        # CONTINUOUS DETECTION MODE (recommended)
+        # ==========================================
+        if continuous_detection:
+            # Use SAM3's native text prompt - detection runs every frame during propagation
+            # This ensures ALL objects matching the text are detected throughout the video,
+            # including those entering the scene later
+            print(f"[SAM3 AutoTrack] Using continuous text detection mode")
+            print(f"[SAM3 AutoTrack]   SAM3 will detect '{text_prompt}' on every frame during propagation")
+
+            # Create text prompt - SAM3 handles object tracking automatically via IoU matching
+            prompt = VideoPrompt.create_text(
+                frame_idx=0,      # Text prompt is applied at frame 0 but affects all frames
+                obj_id=1,         # Placeholder - SAM3 assigns actual IDs during detection
+                text=text_prompt
+            )
+            video_state = video_state.with_prompt(prompt)
+
+            # Create simple visualization of first frame
+            first_frame = video_frames[0]
+            keyframe_viz = first_frame.unsqueeze(0)  # [1, H, W, C]
+
+            print(f"[SAM3 AutoTrack] Complete: Text prompt set for continuous detection")
+            print(f"[SAM3 AutoTrack]   Objects will be detected during SAM3Propagate")
+
+            # Offload model if requested
+            if offload_model:
+                print("[SAM3 AutoTrack] Offloading model to CPU...")
+                sam3_model.unpatch_model()
+                cleanup_gpu_memory()
+
+            # total_objects is unknown until propagation runs - return -1 to indicate continuous mode
+            return (video_state, -1, keyframe_viz)
+
+        # ==========================================
+        # KEYFRAME DETECTION MODE (legacy)
+        # ==========================================
+        print(f"[SAM3 AutoTrack]   Keyframe interval: {keyframe_interval}")
+        print(f"[SAM3 AutoTrack]   Confidence threshold: {confidence_threshold}")
+        print(f"[SAM3 AutoTrack]   IoU threshold: {iou_threshold}")
 
         # 2. Determine keyframes
         keyframes = list(range(0, num_frames, keyframe_interval))

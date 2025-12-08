@@ -466,6 +466,45 @@ This ensures old frames are still cleaned up even with CPU offloading enabled.
 
 ---
 
+### Phase 10: AutoTrack Continuous Detection Mode
+
+**Problem**: Objects entering the scene AFTER frame 0 weren't being tracked. User reported "new hockey players that enter the scene werent being masked at all".
+
+**Root Cause**: AutoTrack's keyframe-based box prompts were being converted to tracker points, but `per_frame_geometric_prompt` wasn't set. During propagation:
+- `has_geometric_prompt = False` for frames without box prompts
+- `allow_new_detections = False` → detector couldn't create new objects
+- Objects at later keyframes existed in tracker metadata but weren't tracked
+
+**Solution**: Added `continuous_detection` mode (default True) that uses SAM3's native text prompt feature:
+
+```python
+# When continuous_detection=True:
+prompt = VideoPrompt.create_text(frame_idx=0, obj_id=1, text=text_prompt)
+video_state = video_state.with_prompt(prompt)
+```
+
+This sets `inference_state["text_prompt"]` which makes `has_text_prompt=True` for ALL frames during propagation. SAM3 then runs detection on every frame, automatically detecting and tracking all matching objects.
+
+**New Parameter** in `SAM3AutoTrack`:
+- `continuous_detection`: BOOLEAN, default True
+  - `True`: Uses SAM3's native text detection on every frame (detects new objects entering scene)
+  - `False`: Original keyframe-only detection (faster but may miss objects entering later)
+
+**Key code paths**:
+- `sam3_video_inference.py:903-905` - text prompt sets `inference_state["text_prompt"]`
+- `sam3_video_inference.py:395` - `has_text_prompt` checked every frame
+- `sam3_video_inference.py:423` - `allow_new_detections=True` when text prompt set
+
+**Trade-offs**:
+- PRO: Detects ALL matching objects throughout video, including those entering later
+- PRO: No more "missing objects" issue
+- CON: Runs detection every frame (slower than keyframe-only)
+- CON: May detect more objects than intended (configure confidence_threshold to limit)
+
+**Location**: `nodes/sam3_auto_track.py` lines 143-146, 264-293
+
+---
+
 ## Architecture Notes
 
 ### Data Flow

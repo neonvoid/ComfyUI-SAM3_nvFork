@@ -83,6 +83,34 @@ def print_vram(label: str, detailed: bool = False):
 
 
 # =============================================================================
+# Bounding Box Utilities for ID Stability
+# =============================================================================
+
+def bbox_iou(box1: list, box2: list) -> float:
+    """
+    Compute IoU between two bounding boxes.
+
+    Args:
+        box1: [x1, y1, x2, y2] format bounding box
+        box2: [x1, y1, x2, y2] format bounding box
+
+    Returns:
+        IoU value between 0 and 1
+    """
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+    union_area = box1_area + box2_area - inter_area
+    return inter_area / union_area if union_area > 0 else 0
+
+
+# =============================================================================
 # VRAM Estimation
 # =============================================================================
 
@@ -764,6 +792,10 @@ class SAM3Propagate:
                     "step": 0.1,
                     "tooltip": "Video framerate for exit delay calculation"
                 }),
+                "lock_initial_objects": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Stabilize object IDs by remapping new detections back to initial objects when they overlap. Prevents ID reassignment during tracking."
+                }),
             }
         }
 
@@ -776,11 +808,11 @@ class SAM3Propagate:
     def IS_CHANGED(cls, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
                    offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False,
                    stream_to_disk=False, mask_output_path="", auto_exit_on_empty=False,
-                   exit_delay_seconds=0.5, video_fps=30.0):
+                   exit_delay_seconds=0.5, video_fps=30.0, lock_initial_objects=True):
         # Use object identity for caching - if upstream node is cached,
         # it returns the same object, so id() will match
         # This is more reliable than hashing content since video_state is immutable
-        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps)
+        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: video_state id={id(video_state)}, session={video_state.session_uuid if video_state else None}")
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: returning {result}")
         return result
@@ -1455,10 +1487,10 @@ class SAM3Propagate:
     def propagate(self, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
                   offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False,
                   stream_to_disk=False, mask_output_path="", auto_exit_on_empty=False,
-                  exit_delay_seconds=0.5, video_fps=30.0):
+                  exit_delay_seconds=0.5, video_fps=30.0, lock_initial_objects=True):
         """Run propagation using reconstructed inference state."""
         # Create cache key using video_state object id (since it's immutable and cached upstream)
-        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps)
+        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
 
         # Check if we have cached result
         if cache_key in SAM3Propagate._cache:
@@ -1539,6 +1571,10 @@ class SAM3Propagate:
             if auto_exit_on_empty:
                 print(f"[SAM3 Video] Early exit enabled: {exit_delay_seconds}s @ {video_fps}fps = {empty_frames_threshold} frames threshold")
 
+            # ID stability tracking (for lock_initial_objects)
+            initial_obj_bboxes = {}  # {obj_id: [x1, y1, x2, y2]} - last known bbox per initial object
+            id_remap = {}  # {new_id: original_id} - persistent ID remapping
+
             autocast_context = _get_autocast_context()
             with autocast_context:
                 print_vram("Before reconstruction (in autocast)")
@@ -1581,6 +1617,77 @@ class SAM3Propagate:
                                 frame_obj_ids = ids
                                 obj_ids_dict[frame_idx] = ids
                                 del outputs["obj_ids"]
+
+                            # --- ID stability correction ---
+                            # Remap IDs when initial objects disappear and new IDs appear in similar positions
+                            if lock_initial_objects and mask is not None and frame_obj_ids:
+                                from .sam3_lib.perflib.masks_ops import masks_to_boxes
+
+                                # Capture initial objects and their bboxes on first frame
+                                if initial_obj_ids is None:
+                                    initial_obj_ids = set(frame_obj_ids)
+                                    try:
+                                        bboxes = masks_to_boxes(mask, frame_obj_ids)
+                                        for i, obj_id in enumerate(frame_obj_ids):
+                                            initial_obj_bboxes[obj_id] = bboxes[i].tolist()
+                                        print(f"[SAM3 Video] ID stability: locked {len(initial_obj_ids)} initial objects {sorted(initial_obj_ids)}")
+                                    except Exception as e:
+                                        print(f"[SAM3 Video] Warning: Could not compute initial bboxes: {e}")
+                                else:
+                                    # Check for potential ID reassignment
+                                    current_ids = set(frame_obj_ids)
+                                    # Missing: initial IDs that are gone (excluding already remapped ones)
+                                    missing_initial = initial_obj_ids - current_ids - set(id_remap.values())
+                                    # New: IDs that weren't in initial set (excluding already remapped sources)
+                                    new_ids = current_ids - initial_obj_ids - set(id_remap.keys())
+
+                                    if missing_initial and new_ids:
+                                        # Compute current bboxes for new IDs
+                                        try:
+                                            bboxes = masks_to_boxes(mask, frame_obj_ids)
+                                            current_bboxes = {}
+                                            for i, obj_id in enumerate(frame_obj_ids):
+                                                current_bboxes[obj_id] = bboxes[i].tolist()
+
+                                            # Match new IDs to missing initial IDs by bbox IoU
+                                            for new_id in list(new_ids):
+                                                if new_id not in current_bboxes:
+                                                    continue
+                                                best_match = None
+                                                best_iou = 0.3  # Minimum IoU threshold for remapping
+                                                for missing_id in list(missing_initial):
+                                                    if missing_id not in initial_obj_bboxes:
+                                                        continue
+                                                    iou = bbox_iou(initial_obj_bboxes[missing_id], current_bboxes[new_id])
+                                                    if iou > best_iou:
+                                                        best_iou = iou
+                                                        best_match = missing_id
+
+                                                if best_match is not None:
+                                                    id_remap[new_id] = best_match
+                                                    missing_initial.discard(best_match)
+                                                    print(f"[SAM3 Video] ID correction: {new_id} → {best_match} (IoU={best_iou:.2f})")
+                                        except Exception as e:
+                                            print(f"[SAM3 Video] Warning: ID correction failed: {e}")
+
+                                    # Apply ID remapping to mask and update frame_obj_ids
+                                    if id_remap:
+                                        # Remap IDs in the mask tensor
+                                        for new_id, orig_id in id_remap.items():
+                                            if new_id in frame_obj_ids:
+                                                mask[mask == new_id] = orig_id
+                                        # Update frame_obj_ids list
+                                        frame_obj_ids = [id_remap.get(i, i) for i in frame_obj_ids]
+                                        obj_ids_dict[frame_idx] = frame_obj_ids
+
+                                    # Update initial object bboxes with current positions (for tracking movement)
+                                    try:
+                                        bboxes = masks_to_boxes(mask, frame_obj_ids)
+                                        for i, obj_id in enumerate(frame_obj_ids):
+                                            if obj_id in initial_obj_ids:
+                                                initial_obj_bboxes[obj_id] = bboxes[i].tolist()
+                                    except Exception:
+                                        pass  # Non-critical: keep old bboxes
 
                             # Bundle mask and obj_ids together for automatic color stability
                             masks_dict[frame_idx] = {

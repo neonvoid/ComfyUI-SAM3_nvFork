@@ -1534,6 +1534,7 @@ class SAM3Propagate:
             consecutive_empty_frames = 0
             last_valid_frame = start_frame
             early_exit_triggered = False
+            initial_obj_ids = None  # Track original objects for early exit (not just any objects)
             empty_frames_threshold = max(1, int(exit_delay_seconds * video_fps)) if auto_exit_on_empty else float('inf')
             if auto_exit_on_empty:
                 print(f"[SAM3 Video] Early exit enabled: {exit_delay_seconds}s @ {video_fps}fps = {empty_frames_threshold} frames threshold")
@@ -1587,12 +1588,28 @@ class SAM3Propagate:
                                 "obj_ids": frame_obj_ids
                             }
 
-                            # Early exit: check if mask is empty (all objects left frame)
+                            # Early exit: check if ORIGINAL objects left (not just any objects)
+                            # This ensures continuous detection (new objects entering) doesn't prevent early exit
                             if auto_exit_on_empty:
-                                mask_is_empty = (mask is None or
-                                                (hasattr(mask, 'shape') and mask.shape[0] == 0) or
-                                                (hasattr(mask, 'numel') and mask.numel() == 0))
-                                if mask_is_empty:
+                                # Get current frame's object IDs
+                                current_obj_ids = set(frame_obj_ids) if frame_obj_ids else set()
+
+                                # Capture initial objects on first frame with detections
+                                if initial_obj_ids is None and current_obj_ids:
+                                    initial_obj_ids = current_obj_ids.copy()
+                                    print(f"[SAM3 Video] Early exit: tracking initial objects {sorted(initial_obj_ids)}")
+
+                                # Check if original objects remain (not just any objects)
+                                if initial_obj_ids:
+                                    original_objects_remaining = initial_obj_ids & current_obj_ids
+                                    all_original_left = len(original_objects_remaining) == 0
+                                else:
+                                    # No initial objects captured yet - use original empty check
+                                    all_original_left = (mask is None or
+                                                        (hasattr(mask, 'shape') and mask.shape[0] == 0) or
+                                                        (hasattr(mask, 'numel') and mask.numel() == 0))
+
+                                if all_original_left:
                                     consecutive_empty_frames += 1
                                 else:
                                     consecutive_empty_frames = 0
@@ -1600,7 +1617,7 @@ class SAM3Propagate:
 
                                 if consecutive_empty_frames >= empty_frames_threshold:
                                     early_exit_triggered = True
-                                    print(f"[SAM3 Video] Early exit: no objects for {consecutive_empty_frames} consecutive frames")
+                                    print(f"[SAM3 Video] Early exit: all {len(initial_obj_ids) if initial_obj_ids else 0} initial objects left frame")
                                     print(f"[SAM3 Video] Last valid frame: {last_valid_frame}")
                                     break
                         else:

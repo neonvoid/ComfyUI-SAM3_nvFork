@@ -52,24 +52,41 @@ class SAM3MaskTracks:
                     "step": 10,
                     "tooltip": "Minimum mask pixels to count frame as 'visible' for metadata"
                 }),
+                "output_bboxes": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Output filled bounding box masks instead of silhouettes. Also adds bbox coordinates to track_info JSON."
+                }),
+                "bbox_padding": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": "Padding (in pixels) to add around bounding boxes"
+                }),
             }
         }
 
-    RETURN_TYPES = ("MASK", "STRING", "INT")
-    RETURN_NAMES = ("all_masks", "track_info", "num_objects")
+    RETURN_TYPES = ("MASK", "MASK", "STRING", "INT")
+    RETURN_NAMES = ("all_masks", "bbox_masks", "track_info", "num_objects")
     FUNCTION = "extract_tracks"
     CATEGORY = "SAM3/video"
 
-    def extract_tracks(self, masks, video_state, scores=None, min_visible_pixels=100):
+    def extract_tracks(self, masks, video_state, scores=None, min_visible_pixels=100, output_bboxes=False, bbox_padding=0):
         """
         Extract all object masks into a single [N_frames, N_objects, H, W] tensor.
 
         Also computes per-object visibility metadata.
+
+        If output_bboxes=True, also computes:
+        - bbox_masks: filled rectangular masks from bounding boxes
+        - bbox coordinates in track_info JSON
         """
         num_frames = video_state.num_frames
         h, w = video_state.height, video_state.width
 
         print(f"[SAM3 MaskTracks] Extracting tracks from {num_frames} frames")
+        if output_bboxes:
+            print(f"[SAM3 MaskTracks] Bounding box output enabled (padding={bbox_padding}px)")
 
         # Determine number of objects from mask data
         num_objects = 0
@@ -91,7 +108,7 @@ class SAM3MaskTracks:
                 "total_frames": num_frames,
                 "total_objects": 0,
             }, indent=2)
-            return (empty_masks, track_info, 0)
+            return (empty_masks, empty_masks, track_info, 0)
 
         print(f"[SAM3 MaskTracks] Found {num_objects} objects")
 
@@ -105,10 +122,14 @@ class SAM3MaskTracks:
                 "last_frame": None,
                 "visible_frames": 0,
                 "total_pixels": 0,
-                "scores": []
+                "scores": [],
+                "bboxes": {}  # frame_idx -> [x1, y1, x2, y2]
             }
             for i in range(num_objects)
         }
+
+        # Also build bbox_masks if requested
+        bbox_masks = torch.zeros(num_frames, num_objects, h, w) if output_bboxes else None
 
         for frame_idx in range(num_frames):
             if frame_idx in masks:
@@ -151,6 +172,18 @@ class SAM3MaskTracks:
                             object_info[oid]["visible_frames"] += 1
                             object_info[oid]["total_pixels"] += pixel_count
 
+                            # Compute bounding box if enabled
+                            if output_bboxes:
+                                ys, xs = torch.where(obj_mask > 0.5)
+                                if len(xs) > 0:
+                                    x1 = max(0, xs.min().item() - bbox_padding)
+                                    y1 = max(0, ys.min().item() - bbox_padding)
+                                    x2 = min(w, xs.max().item() + 1 + bbox_padding)
+                                    y2 = min(h, ys.max().item() + 1 + bbox_padding)
+                                    object_info[oid]["bboxes"][frame_idx] = [x1, y1, x2, y2]
+                                    # Fill bbox mask
+                                    bbox_masks[frame_idx, oid, y1:y2, x1:x2] = 1.0
+
                 elif frame_mask.dim() == 2:
                     # Single mask [H, W]
                     obj_mask = frame_mask.float()
@@ -175,6 +208,18 @@ class SAM3MaskTracks:
                         object_info[0]["visible_frames"] += 1
                         object_info[0]["total_pixels"] += pixel_count
 
+                        # Compute bounding box if enabled
+                        if output_bboxes:
+                            ys, xs = torch.where(obj_mask > 0.5)
+                            if len(xs) > 0:
+                                x1 = max(0, xs.min().item() - bbox_padding)
+                                y1 = max(0, ys.min().item() - bbox_padding)
+                                x2 = min(w, xs.max().item() + 1 + bbox_padding)
+                                y2 = min(h, ys.max().item() + 1 + bbox_padding)
+                                object_info[0]["bboxes"][frame_idx] = [x1, y1, x2, y2]
+                                # Fill bbox mask
+                                bbox_masks[frame_idx, 0, y1:y2, x1:x2] = 1.0
+
             # Collect scores if available
             if scores is not None and frame_idx in scores:
                 frame_scores = scores[frame_idx]
@@ -194,29 +239,40 @@ class SAM3MaskTracks:
                 object_info[oid]["avg_score"] = None
 
         # Build track_info JSON
-        track_info = {
-            "objects": [
-                {
+        objects_list = []
+        for oid, info in object_info.items():
+            if info["first_frame"] is not None:
+                obj_entry = {
                     "id": oid,
                     "first_frame": info["first_frame"],
                     "last_frame": info["last_frame"],
                     "visible_frames": info["visible_frames"],
                     "avg_score": round(info["avg_score"], 4) if info["avg_score"] is not None else None,
                 }
-                for oid, info in object_info.items()
-                if info["first_frame"] is not None
-            ],
+                # Include bbox data if enabled
+                if output_bboxes and info["bboxes"]:
+                    obj_entry["bboxes"] = info["bboxes"]
+                objects_list.append(obj_entry)
+
+        track_info = {
+            "objects": objects_list,
             "total_frames": num_frames,
             "total_objects": num_objects,
             "dimensions": {"height": h, "width": w},
+            "bbox_output_enabled": output_bboxes,
         }
 
         # Print summary
         for obj in track_info["objects"]:
             score_str = f", avg_score={obj['avg_score']:.3f}" if obj['avg_score'] else ""
-            print(f"[SAM3 MaskTracks]   Object {obj['id']}: frames {obj['first_frame']}-{obj['last_frame']} ({obj['visible_frames']} visible){score_str}")
+            bbox_str = f", {len(obj.get('bboxes', {}))} bboxes" if output_bboxes else ""
+            print(f"[SAM3 MaskTracks]   Object {obj['id']}: frames {obj['first_frame']}-{obj['last_frame']} ({obj['visible_frames']} visible){score_str}{bbox_str}")
 
-        return (all_masks, json.dumps(track_info, indent=2), num_objects)
+        # If bbox output not enabled, return all_masks as bbox_masks (identity)
+        if bbox_masks is None:
+            bbox_masks = all_masks
+
+        return (all_masks, bbox_masks, json.dumps(track_info, indent=2), num_objects)
 
 
 class SAM3SelectMask:

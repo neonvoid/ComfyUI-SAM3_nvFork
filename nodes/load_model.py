@@ -137,6 +137,33 @@ class SAM3UnifiedModel(SAM3ModelPatcher):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def clear_all_sessions(self):
+        """
+        Clear all inference sessions from memory.
+
+        Call this to free GPU memory held by video tracking sessions.
+        Sessions are stored in a class-level dict that persists until cleared.
+        """
+        from .sam3_lib.sam3_video_predictor import Sam3VideoPredictor
+
+        num_sessions = len(Sam3VideoPredictor._ALL_INFERENCE_STATES)
+        if num_sessions > 0:
+            print(f"[SAM3] Clearing {num_sessions} inference session(s)...")
+            Sam3VideoPredictor._ALL_INFERENCE_STATES.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"[SAM3] Sessions cleared, VRAM freed")
+        return num_sessions
+
+    def cleanup(self):
+        """Full cleanup: clear sessions and unload model."""
+        self.clear_all_sessions()
+        self.unpatch_model()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 
 class LoadSAM3Model:
     """

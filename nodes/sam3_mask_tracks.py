@@ -88,11 +88,21 @@ class SAM3MaskTracks:
         if output_bboxes:
             print(f"[SAM3 MaskTracks] Bounding box output enabled (padding={bbox_padding}px)")
 
+        # Helper to extract tensor from mask data (handles both dict and raw tensor formats)
+        def get_mask_tensor(mask_data):
+            """Extract mask tensor from mask data (dict or raw tensor)."""
+            if isinstance(mask_data, dict):
+                # New format: {"mask": tensor, "obj_ids": [...]}
+                return mask_data.get("mask")
+            return mask_data
+
         # Determine number of objects from mask data
         num_objects = 0
         for frame_idx in range(num_frames):
             if frame_idx in masks:
-                frame_mask = masks[frame_idx]
+                frame_mask = get_mask_tensor(masks[frame_idx])
+                if frame_mask is None:
+                    continue
                 if isinstance(frame_mask, np.ndarray):
                     frame_mask = torch.from_numpy(frame_mask)
                 if frame_mask.dim() == 3:
@@ -133,7 +143,9 @@ class SAM3MaskTracks:
 
         for frame_idx in range(num_frames):
             if frame_idx in masks:
-                frame_mask = masks[frame_idx]
+                frame_mask = get_mask_tensor(masks[frame_idx])
+                if frame_mask is None:
+                    continue
 
                 # Convert numpy to torch if needed
                 if isinstance(frame_mask, np.ndarray):

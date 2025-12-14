@@ -331,6 +331,43 @@ class SAM3VideoSegmentation:
                     "default": False,
                     "tooltip": "Store inference state on CPU (10-15% slower, saves ~3-5GB VRAM for long videos)"
                 }),
+                # === Advanced: Hotstart & Detection Tuning ===
+                # These parameters control how new objects are detected and validated
+                "hotstart_delay": ("INT", {
+                    "default": 15,
+                    "min": 0,
+                    "max": 60,
+                    "step": 1,
+                    "tooltip": "Frames before new objects are confirmed. Lower=faster detection of entering objects, Higher=more stable (filters false positives). Set to 0 to disable hotstart filtering."
+                }),
+                "hotstart_unmatch_thresh": ("INT", {
+                    "default": 8,
+                    "min": 1,
+                    "max": 30,
+                    "step": 1,
+                    "tooltip": "Unmatched frames within hotstart period before track is removed. Higher=more tolerant of missed detections (good for fast movement/occlusion)."
+                }),
+                "hotstart_dup_thresh": ("INT", {
+                    "default": 8,
+                    "min": 1,
+                    "max": 30,
+                    "step": 1,
+                    "tooltip": "Overlapping frames within hotstart period before duplicate track is removed. Higher=more tolerant of overlapping objects."
+                }),
+                "new_det_thresh": ("FLOAT", {
+                    "default": 0.4,
+                    "min": 0.1,
+                    "max": 0.9,
+                    "step": 0.05,
+                    "tooltip": "Confidence threshold for creating new object tracks. Lower=easier to detect new objects (may increase false positives)."
+                }),
+                "assoc_iou_thresh": ("FLOAT", {
+                    "default": 0.1,
+                    "min": 0.01,
+                    "max": 0.5,
+                    "step": 0.01,
+                    "tooltip": "IoU threshold for associating detections with existing tracks. Lower=stricter matching (may create duplicate tracks)."
+                }),
             }
         }
 
@@ -339,7 +376,9 @@ class SAM3VideoSegmentation:
                    positive_points=None, negative_points=None,
                    positive_boxes=None, negative_boxes=None,
                    frame_idx=0, score_threshold=0.3,
-                   offload_video_to_cpu=True, offload_state_to_cpu=False):
+                   offload_video_to_cpu=True, offload_state_to_cpu=False,
+                   hotstart_delay=15, hotstart_unmatch_thresh=8, hotstart_dup_thresh=8,
+                   new_det_thresh=0.4, assoc_iou_thresh=0.1):
         # Use a stable hash based on video content
         # Don't use float(mean()) - it has floating point precision issues on GPU
         import hashlib
@@ -371,6 +410,11 @@ class SAM3VideoSegmentation:
             score_threshold,
             offload_video_to_cpu,
             offload_state_to_cpu,
+            hotstart_delay,
+            hotstart_unmatch_thresh,
+            hotstart_dup_thresh,
+            new_det_thresh,
+            assoc_iou_thresh,
         ))
         print(f"[IS_CHANGED DEBUG] SAM3VideoSegmentation: video_hash={video_hash}, prompt_mode={prompt_mode}")
         print(f"[IS_CHANGED DEBUG] SAM3VideoSegmentation: positive_points={positive_points}")
@@ -387,7 +431,9 @@ class SAM3VideoSegmentation:
                 positive_points=None, negative_points=None,
                 positive_boxes=None, negative_boxes=None,
                 frame_idx=0, score_threshold=0.3,
-                offload_video_to_cpu=True, offload_state_to_cpu=False):
+                offload_video_to_cpu=True, offload_state_to_cpu=False,
+                hotstart_delay=15, hotstart_unmatch_thresh=8, hotstart_dup_thresh=8,
+                new_det_thresh=0.4, assoc_iou_thresh=0.1):
         """Initialize video state and add prompts based on selected mode."""
         # Create cache key from inputs
         import hashlib
@@ -410,6 +456,11 @@ class SAM3VideoSegmentation:
         h.update(str(score_threshold).encode())
         h.update(str(offload_video_to_cpu).encode())
         h.update(str(offload_state_to_cpu).encode())
+        h.update(str(hotstart_delay).encode())
+        h.update(str(hotstart_unmatch_thresh).encode())
+        h.update(str(hotstart_dup_thresh).encode())
+        h.update(str(new_det_thresh).encode())
+        h.update(str(assoc_iou_thresh).encode())
         cache_key = h.hexdigest()
 
         # Check if we have cached result
@@ -426,6 +477,12 @@ class SAM3VideoSegmentation:
             score_threshold_detection=score_threshold,
             offload_video_to_cpu=offload_video_to_cpu,
             offload_state_to_cpu=offload_state_to_cpu,
+            # Hotstart & detection tuning
+            hotstart_delay=hotstart_delay,
+            hotstart_unmatch_thresh=hotstart_unmatch_thresh,
+            hotstart_dup_thresh=hotstart_dup_thresh,
+            new_det_thresh=new_det_thresh,
+            assoc_iou_thresh=assoc_iou_thresh,
         )
         video_state = create_video_state(
             video_frames=video_frames,
@@ -435,6 +492,8 @@ class SAM3VideoSegmentation:
         print(f"[SAM3 Video] Initialized session {video_state.session_uuid[:8]}")
         print(f"[SAM3 Video] Frames: {video_state.num_frames}, Size: {video_state.width}x{video_state.height}")
         print(f"[SAM3 Video] Prompt mode: {prompt_mode}")
+        print(f"[SAM3 Video] Hotstart config: delay={hotstart_delay}, unmatch_thresh={hotstart_unmatch_thresh}, dup_thresh={hotstart_dup_thresh}")
+        print(f"[SAM3 Video] Detection config: new_det_thresh={new_det_thresh}, assoc_iou_thresh={assoc_iou_thresh}")
 
         # 2. Add prompts based on mode (mutually exclusive)
         obj_id = 1

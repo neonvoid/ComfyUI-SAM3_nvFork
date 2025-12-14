@@ -164,6 +164,42 @@ class SAM3AutoTrack:
                     "default": False,
                     "tooltip": "Store inference state on CPU (10-15% slower, saves ~3-5GB VRAM for long videos)"
                 }),
+                # === Advanced: Hotstart & Detection Tuning ===
+                "hotstart_delay": ("INT", {
+                    "default": 15,
+                    "min": 0,
+                    "max": 60,
+                    "step": 1,
+                    "tooltip": "Frames before new objects are confirmed. Lower=faster detection of entering objects, Higher=more stable (filters false positives). Set to 0 to disable hotstart filtering."
+                }),
+                "hotstart_unmatch_thresh": ("INT", {
+                    "default": 8,
+                    "min": 1,
+                    "max": 30,
+                    "step": 1,
+                    "tooltip": "Unmatched frames within hotstart period before track is removed. Higher=more tolerant of missed detections (good for fast movement/occlusion)."
+                }),
+                "hotstart_dup_thresh": ("INT", {
+                    "default": 8,
+                    "min": 1,
+                    "max": 30,
+                    "step": 1,
+                    "tooltip": "Overlapping frames within hotstart period before duplicate track is removed. Higher=more tolerant of overlapping objects."
+                }),
+                "new_det_thresh": ("FLOAT", {
+                    "default": 0.4,
+                    "min": 0.1,
+                    "max": 0.9,
+                    "step": 0.05,
+                    "tooltip": "Confidence threshold for creating new object tracks. Lower=easier to detect new objects (may increase false positives)."
+                }),
+                "assoc_iou_thresh": ("FLOAT", {
+                    "default": 0.1,
+                    "min": 0.01,
+                    "max": 0.5,
+                    "step": 0.01,
+                    "tooltip": "IoU threshold for associating detections with existing tracks. Lower=stricter matching (may create duplicate tracks)."
+                }),
             }
         }
 
@@ -219,7 +255,10 @@ class SAM3AutoTrack:
                    iou_threshold: float = 0.3, max_objects: int = -1,
                    continuous_detection: bool = True,
                    score_threshold: float = 0.3, offload_model: bool = False,
-                   offload_video_to_cpu: bool = True, offload_state_to_cpu: bool = False):
+                   offload_video_to_cpu: bool = True, offload_state_to_cpu: bool = False,
+                   hotstart_delay: int = 15, hotstart_unmatch_thresh: int = 8,
+                   hotstart_dup_thresh: int = 8, new_det_thresh: float = 0.4,
+                   assoc_iou_thresh: float = 0.1):
         """
         Perform automatic multi-instance detection and tracking setup.
 
@@ -249,12 +288,20 @@ class SAM3AutoTrack:
         print(f"[SAM3 AutoTrack]   Text prompt: '{text_prompt}'")
         print(f"[SAM3 AutoTrack]   Mode: {'CONTINUOUS (every frame)' if continuous_detection else f'KEYFRAME (every {keyframe_interval} frames)'}")
         print(f"[SAM3 AutoTrack]   Memory offload: video={offload_video_to_cpu}, state={offload_state_to_cpu}")
+        print(f"[SAM3 AutoTrack]   Hotstart config: delay={hotstart_delay}, unmatch_thresh={hotstart_unmatch_thresh}, dup_thresh={hotstart_dup_thresh}")
+        print(f"[SAM3 AutoTrack]   Detection config: new_det_thresh={new_det_thresh}, assoc_iou_thresh={assoc_iou_thresh}")
 
         # 1. Create video state
         config = VideoConfig(
             score_threshold_detection=score_threshold,
             offload_video_to_cpu=offload_video_to_cpu,
             offload_state_to_cpu=offload_state_to_cpu,
+            # Hotstart & detection tuning
+            hotstart_delay=hotstart_delay,
+            hotstart_unmatch_thresh=hotstart_unmatch_thresh,
+            hotstart_dup_thresh=hotstart_dup_thresh,
+            new_det_thresh=new_det_thresh,
+            assoc_iou_thresh=assoc_iou_thresh,
         )
         video_state = create_video_state(video_frames, config=config)
 

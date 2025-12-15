@@ -1553,6 +1553,11 @@ class SAM3Propagate:
                   range_detection_only=False, stream_to_disk=False, mask_output_path="",
                   auto_exit_on_empty=False, exit_delay_seconds=0.5, video_fps=30.0, lock_initial_objects=True):
         """Run propagation using reconstructed inference state."""
+        # Handle None values from ComfyUI (can happen with new parameters on old workflows)
+        start_frame = start_frame if start_frame is not None else 0
+        end_frame = end_frame if end_frame is not None else -1
+        backward_stop_frame = backward_stop_frame if backward_stop_frame is not None else -1
+
         # Create cache key using video_state object id (since it's immutable and cached upstream)
         cache_key = (id(video_state), start_frame, end_frame, backward_stop_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
 
@@ -1837,8 +1842,9 @@ class SAM3Propagate:
 
             # Handle early exit: truncate output and create metadata
             if auto_exit_on_empty:
-                if early_exit_triggered:
-                    # Truncate masks_dict to only include valid frames
+                if early_exit_triggered and direction == "forward":
+                    # Only truncate for forward-only propagation
+                    # For bidirectional, early exit on forward shouldn't remove backward frames
                     frames_to_remove = [f for f in masks_dict.keys() if f > last_valid_frame]
                     for f in frames_to_remove:
                         del masks_dict[f]
@@ -1851,16 +1857,17 @@ class SAM3Propagate:
                     print(f"[SAM3 Video] Truncated output to {len(masks_dict)} valid frames (0-{last_valid_frame})")
 
                 # Create track_info with early exit metadata
-                # For bidirectional propagation, actual_start_frame is the min frame in masks_dict
-                # (not the input start_frame parameter, which is the prompt frame)
+                # For bidirectional propagation, use masks_dict keys to determine actual frame range
+                # (last_valid_frame variable gets overwritten by backward pass, so use max of masks_dict)
                 actual_start_frame = min(masks_dict.keys()) if masks_dict else start_frame
+                actual_last_frame = max(masks_dict.keys()) if masks_dict else actual_end_frame
                 track_info = {
                     "early_exit_enabled": True,
                     "early_exit_triggered": early_exit_triggered,
                     "exit_delay_seconds": exit_delay_seconds,
                     "video_fps": video_fps,
                     "empty_frames_threshold": empty_frames_threshold,
-                    "last_valid_frame": last_valid_frame,
+                    "last_valid_frame": actual_last_frame,  # Use max of masks_dict, not the variable
                     "total_valid_frames": len(masks_dict),
                     "original_end_frame": actual_end_frame,
                     "start_frame": actual_start_frame,

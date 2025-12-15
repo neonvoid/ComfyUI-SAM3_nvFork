@@ -800,7 +800,12 @@ class SAM3Propagate:
                 "end_frame": ("INT", {
                     "default": -1,
                     "min": -1,
-                    "tooltip": "End frame (-1 for all)"
+                    "tooltip": "End frame for forward propagation (-1 for all)"
+                }),
+                "backward_stop_frame": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "tooltip": "Stop backward propagation at this frame (-1 to go all the way to frame 0). Only used when direction is 'backward' or 'both'."
                 }),
                 "direction": (["forward", "backward", "both"], {
                     "default": "forward",
@@ -864,14 +869,14 @@ class SAM3Propagate:
     CATEGORY = "SAM3/video"
 
     @classmethod
-    def IS_CHANGED(cls, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
-                   offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False,
-                   stream_to_disk=False, mask_output_path="", auto_exit_on_empty=False,
-                   exit_delay_seconds=0.5, video_fps=30.0, lock_initial_objects=True):
+    def IS_CHANGED(cls, sam3_model, video_state, start_frame=0, end_frame=-1, backward_stop_frame=-1,
+                   direction="forward", offload_model=False, enable_chunking=False, chunk_size=250,
+                   range_detection_only=False, stream_to_disk=False, mask_output_path="",
+                   auto_exit_on_empty=False, exit_delay_seconds=0.5, video_fps=30.0, lock_initial_objects=True):
         # Use object identity for caching - if upstream node is cached,
         # it returns the same object, so id() will match
         # This is more reliable than hashing content since video_state is immutable
-        result = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
+        result = (id(video_state), start_frame, end_frame, backward_stop_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: video_state id={id(video_state)}, session={video_state.session_uuid if video_state else None}")
         print(f"[IS_CHANGED DEBUG] SAM3Propagate: returning {result}")
         return result
@@ -1543,13 +1548,13 @@ class SAM3Propagate:
 
         return {}, {}, json.dumps(track_info, indent=2), mask_dir
 
-    def propagate(self, sam3_model, video_state, start_frame=0, end_frame=-1, direction="forward",
-                  offload_model=False, enable_chunking=False, chunk_size=250, range_detection_only=False,
-                  stream_to_disk=False, mask_output_path="", auto_exit_on_empty=False,
-                  exit_delay_seconds=0.5, video_fps=30.0, lock_initial_objects=True):
+    def propagate(self, sam3_model, video_state, start_frame=0, end_frame=-1, backward_stop_frame=-1,
+                  direction="forward", offload_model=False, enable_chunking=False, chunk_size=250,
+                  range_detection_only=False, stream_to_disk=False, mask_output_path="",
+                  auto_exit_on_empty=False, exit_delay_seconds=0.5, video_fps=30.0, lock_initial_objects=True):
         """Run propagation using reconstructed inference state."""
         # Create cache key using video_state object id (since it's immutable and cached upstream)
-        cache_key = (id(video_state), start_frame, end_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
+        cache_key = (id(video_state), start_frame, end_frame, backward_stop_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
 
         # Check if we have cached result
         if cache_key in SAM3Propagate._cache:
@@ -1603,17 +1608,21 @@ class SAM3Propagate:
             )
         else:
             # Standard single-pass propagation
-            print(f"[SAM3 Video] Starting propagation: frames {start_frame} to {actual_end_frame}")
+            backward_info = f", backward_stop={backward_stop_frame}" if direction in ["backward", "both"] else ""
+            print(f"[SAM3 Video] Starting propagation: frames {start_frame} to {actual_end_frame}, direction={direction}{backward_info}")
             print(f"[SAM3 Video] Prompts: {len(video_state.prompts)}")
             print_vram("Before propagation start")
 
             # Build propagation request - uses predictor's handle_stream_request API
+            # backward_stop_frame: -1 means go to frame 0, otherwise stop at specified frame
+            actual_backward_stop = backward_stop_frame if backward_stop_frame >= 0 else 0
             request = {
                 "type": "propagate_in_video",
                 "session_id": video_state.session_uuid,
                 "propagation_direction": direction,
                 "start_frame_index": start_frame,
                 "max_frame_num_to_track": actual_end_frame - start_frame + 1,
+                "backward_stop_frame": actual_backward_stop,
             }
 
             # Run ALL inference inside autocast context for dtype consistency
@@ -1842,6 +1851,9 @@ class SAM3Propagate:
                     print(f"[SAM3 Video] Truncated output to {len(masks_dict)} valid frames (0-{last_valid_frame})")
 
                 # Create track_info with early exit metadata
+                # For bidirectional propagation, actual_start_frame is the min frame in masks_dict
+                # (not the input start_frame parameter, which is the prompt frame)
+                actual_start_frame = min(masks_dict.keys()) if masks_dict else start_frame
                 track_info = {
                     "early_exit_enabled": True,
                     "early_exit_triggered": early_exit_triggered,
@@ -1851,7 +1863,21 @@ class SAM3Propagate:
                     "last_valid_frame": last_valid_frame,
                     "total_valid_frames": len(masks_dict),
                     "original_end_frame": actual_end_frame,
-                    "start_frame": start_frame,
+                    "start_frame": actual_start_frame,
+                }
+                track_info_json = json.dumps(track_info, indent=2)
+            else:
+                # Default track_info when auto_exit is disabled
+                # For bidirectional propagation, compute actual frame range from masks_dict
+                actual_start_frame = min(masks_dict.keys()) if masks_dict else start_frame
+                actual_last_frame = max(masks_dict.keys()) if masks_dict else actual_end_frame
+                track_info = {
+                    "early_exit_enabled": False,
+                    "early_exit_triggered": False,
+                    "last_valid_frame": actual_last_frame,
+                    "total_valid_frames": len(masks_dict),
+                    "original_end_frame": actual_end_frame,
+                    "start_frame": actual_start_frame,
                 }
                 track_info_json = json.dumps(track_info, indent=2)
 

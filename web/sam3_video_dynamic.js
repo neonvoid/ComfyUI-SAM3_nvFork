@@ -15,6 +15,15 @@ function log(...args) {
     }
 }
 
+// Canonical order for inputs - positive always before negative
+const INPUT_ORDER = [
+    "video_frames",
+    "positive_points",
+    "negative_points",
+    "positive_boxes",
+    "negative_boxes",
+];
+
 // Helper function to hide a widget
 function hideWidget(node, widget) {
     if (!widget) return;
@@ -90,24 +99,23 @@ function showWidget(node, widget) {
 function hideInput(node, inputName) {
     if (!node.inputs) return;
 
+    // Check if already in hidden map (already hidden)
+    if (node._hiddenInputs && node._hiddenInputs[inputName]) {
+        log("  Input already in hidden map:", inputName);
+        return;
+    }
+
     const index = node.inputs.findIndex(input => input.name === inputName);
     if (index === -1) {
-        log("  Input not found:", inputName);
+        log("  Input not found on node:", inputName);
         return;
     }
 
     const input = node.inputs[index];
 
-    // Already hidden
-    if (input._hidden) {
-        log("  Input already hidden:", inputName);
-        return;
-    }
-
     log("Hiding input:", inputName, "at index:", index);
 
-    // Store for restoration
-    input._originalIndex = index;
+    // Mark as hidden
     input._hidden = true;
 
     // Store in a hidden inputs map on the node
@@ -133,8 +141,35 @@ function hideInput(node, inputName) {
     log("  Input removed, remaining inputs:", node.inputs.length);
 }
 
+// Helper function to find correct insert position based on canonical order
+function findInsertPosition(node, inputName) {
+    const targetOrder = INPUT_ORDER.indexOf(inputName);
+    if (targetOrder === -1) {
+        // Unknown input, add at end
+        return node.inputs.length;
+    }
+
+    // Find where to insert to maintain canonical order
+    for (let i = 0; i < node.inputs.length; i++) {
+        const existingOrder = INPUT_ORDER.indexOf(node.inputs[i].name);
+        if (existingOrder === -1) continue;
+        if (existingOrder > targetOrder) {
+            return i;
+        }
+    }
+    return node.inputs.length;
+}
+
 // Helper function to show an input slot (restores to node.inputs)
 function showInput(node, inputName) {
+    // Check if input is already visible
+    const existingIndex = node.inputs?.findIndex(input => input.name === inputName);
+    if (existingIndex !== -1) {
+        log("  Input already visible:", inputName);
+        return;
+    }
+
+    // Check hidden inputs map
     if (!node._hiddenInputs || !node._hiddenInputs[inputName]) {
         log("  Input not in hidden list:", inputName);
         return;
@@ -142,22 +177,15 @@ function showInput(node, inputName) {
 
     const input = node._hiddenInputs[inputName];
 
-    if (!input._hidden) {
-        log("  Input already visible:", inputName);
-        return;
-    }
-
     log("Showing input:", inputName);
 
-    // Find the correct position to insert
-    // Try to restore at original index, but clamp to valid range
-    const targetIndex = input._originalIndex;
-    const insertIndex = Math.min(targetIndex, node.inputs.length);
+    // Find the correct position based on canonical order
+    const insertIndex = findInsertPosition(node, inputName);
 
     // Clear hidden flag
     input._hidden = false;
 
-    // Re-insert into inputs array
+    // Re-insert into inputs array at correct position
     node.inputs.splice(insertIndex, 0, input);
 
     // Remove from hidden map
@@ -197,6 +225,20 @@ app.registerExtension({
 
     async nodeCreated(node) {
         if (node.comfyClass === "SAM3VideoSegmentation") {
+            // Store reference to extension for configure callback
+            const ext = this;
+
+            // Hook into configure to handle workflow reload
+            const origConfigure = node.configure;
+            node.configure = function(data) {
+                const result = origConfigure?.apply(this, arguments);
+                // Re-setup after workflow loads
+                setTimeout(() => {
+                    ext.setupVideoSegmentation(node);
+                }, 150);
+                return result;
+            };
+
             setTimeout(() => {
                 this.setupVideoSegmentation(node);
             }, 100);
@@ -225,6 +267,22 @@ app.registerExtension({
             text_prompt: !!textPromptWidget,
         });
 
+        // Ensure _hiddenInputs map exists
+        if (!node._hiddenInputs) {
+            node._hiddenInputs = {};
+        }
+
+        // Pre-populate _hiddenInputs with any mode-specific inputs that exist
+        // This handles workflow reload where inputs exist but aren't in the hidden map
+        const modeInputs = ["positive_points", "negative_points", "positive_boxes", "negative_boxes"];
+        for (const inputName of modeInputs) {
+            const existingIndex = node.inputs?.findIndex(input => input.name === inputName);
+            if (existingIndex !== -1 && !node._hiddenInputs[inputName]) {
+                // Input exists on node but not in hidden map - we'll need to manage it
+                log("Pre-registering existing input for management:", inputName);
+            }
+        }
+
         // Function to update visibility based on mode
         const updateVisibility = (mode) => {
             log("Updating visibility for mode:", mode);
@@ -239,19 +297,23 @@ app.registerExtension({
             }
 
             // Point mode inputs (these are input SLOTS, not widgets)
+            // Show first (in correct order), then hide others
             if (mode === "point") {
+                // Ensure inputs are shown in correct order: positive first, then negative
                 showInput(node, "positive_points");
                 showInput(node, "negative_points");
-            } else {
+                hideInput(node, "positive_boxes");
+                hideInput(node, "negative_boxes");
+            } else if (mode === "box") {
                 hideInput(node, "positive_points");
                 hideInput(node, "negative_points");
-            }
-
-            // Box mode inputs
-            if (mode === "box") {
+                // Ensure inputs are shown in correct order: positive first, then negative
                 showInput(node, "positive_boxes");
                 showInput(node, "negative_boxes");
             } else {
+                // Text mode - hide all point/box inputs
+                hideInput(node, "positive_points");
+                hideInput(node, "negative_points");
                 hideInput(node, "positive_boxes");
                 hideInput(node, "negative_boxes");
             }

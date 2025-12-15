@@ -115,6 +115,7 @@ class Sam3VideoPredictor:
                 propagation_direction=request.get("propagation_direction", "both"),
                 start_frame_idx=request.get("start_frame_index", None),
                 max_frame_num_to_track=request.get("max_frame_num_to_track", None),
+                backward_stop_frame=request.get("backward_stop_frame", 0),
             )
         else:
             raise RuntimeError(f"invalid request type: {request_type}")
@@ -276,11 +277,20 @@ class Sam3VideoPredictor:
         propagation_direction,
         start_frame_idx,
         max_frame_num_to_track,
+        backward_stop_frame=0,
     ):
-        """Propagate the added prompts to get grounding results on all video frames."""
+        """Propagate the added prompts to get grounding results on all video frames.
+
+        Args:
+            session_id: Session identifier
+            propagation_direction: 'forward', 'backward', or 'both'
+            start_frame_idx: Frame where prompts were added
+            max_frame_num_to_track: Max frames for forward propagation
+            backward_stop_frame: Stop backward propagation at this frame (default 0 = first frame)
+        """
         logger.debug(
             f"propagate in video in session {session_id}: "
-            f"{propagation_direction=}, {start_frame_idx=}, {max_frame_num_to_track=}"
+            f"{propagation_direction=}, {start_frame_idx=}, {max_frame_num_to_track=}, {backward_stop_frame=}"
         )
         try:
             session = self._get_session(session_id)
@@ -301,13 +311,20 @@ class Sam3VideoPredictor:
                     yield {"frame_index": frame_idx, "outputs": outputs}
             # Then doing the backward propagation (reverse in time)
             if propagation_direction in ["both", "backward"]:
-                for frame_idx, outputs in self.model.propagate_in_video(
-                    inference_state=inference_state,
-                    start_frame_idx=start_frame_idx,
-                    max_frame_num_to_track=max_frame_num_to_track,
-                    reverse=True,
-                ):
-                    yield {"frame_index": frame_idx, "outputs": outputs}
+                # Calculate max frames for backward pass to stop at backward_stop_frame
+                # If start_frame_idx=349 and backward_stop_frame=273, we want to track 349-273=76 frames backward
+                backward_max_frames = start_frame_idx - backward_stop_frame
+                if backward_max_frames <= 0:
+                    logger.debug(f"Skipping backward propagation: start_frame_idx={start_frame_idx} <= backward_stop_frame={backward_stop_frame}")
+                else:
+                    logger.debug(f"Backward propagation: {backward_max_frames} frames (from {start_frame_idx} to {backward_stop_frame})")
+                    for frame_idx, outputs in self.model.propagate_in_video(
+                        inference_state=inference_state,
+                        start_frame_idx=start_frame_idx,
+                        max_frame_num_to_track=backward_max_frames,
+                        reverse=True,
+                    ):
+                        yield {"frame_index": frame_idx, "outputs": outputs}
         finally:
             # Log upon completion (so that e.g. we can see if two propagations happen in parallel).
             # Using `finally` here to log even when the tracking is aborted with GeneratorExit.

@@ -1960,15 +1960,19 @@ class SAM3VideoOutput:
                     "default": True,
                     "tooltip": "Draw legend on visualization (disable for faster processing)"
                 }),
+                "mask_colors": ("STRING", {
+                    "default": "",
+                    "tooltip": "Custom mask colors (comma-separated). Names: red, blue, green, yellow, magenta, cyan, orange, purple, pink, lime, teal, coral, gold, navy. Or hex: #FF0000. Order matches object IDs. Empty = default colors."
+                }),
             }
         }
 
     @classmethod
-    def IS_CHANGED(cls, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True):
+    def IS_CHANGED(cls, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True, mask_colors=""):
         # Always re-run this node when params change, but this is cheap
         # The key is that changing these here does NOT invalidate upstream cache
         # ComfyUI caches based on input values - masks/video_state don't change
-        return (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend)
+        return (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend, mask_colors)
 
     RETURN_TYPES = ("MASK", "IMAGE", "IMAGE")
     RETURN_NAMES = ("masks", "frames", "visualization")
@@ -2027,13 +2031,14 @@ class SAM3VideoOutput:
 
         return vis_frame
 
-    def extract(self, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True):
+    def extract(self, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True, mask_colors=""):
         """Extract all masks as a batch [N, H, W]."""
         from PIL import Image
         import os
+        from .utils import get_color_palette, DEFAULT_COLORS
 
         # Create cache key
-        cache_key = (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend)
+        cache_key = (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend, mask_colors)
 
         # Check if we have cached result
         if cache_key in SAM3VideoOutput._cache:
@@ -2056,17 +2061,21 @@ class SAM3VideoOutput:
         frame_list = []
         vis_list = []
 
-        # Color palette for multiple objects (RGB, 0-1 range)
-        colors = [
-            [0.0, 0.5, 1.0],   # Blue
-            [1.0, 0.3, 0.3],   # Red
-            [0.3, 1.0, 0.3],   # Green
-            [1.0, 1.0, 0.0],   # Yellow
-            [1.0, 0.0, 1.0],   # Magenta
-            [0.0, 1.0, 1.0],   # Cyan
-            [1.0, 0.5, 0.0],   # Orange
-            [0.5, 0.0, 1.0],   # Purple
-        ]
+        # Get color palette - user colors first, then defaults
+        # Estimate max objects from first available mask
+        max_objects = 8  # Default estimate
+        for frame_idx in masks:
+            mask_data = masks[frame_idx]
+            if isinstance(mask_data, dict):
+                m = mask_data.get("mask")
+            else:
+                m = mask_data
+            if m is not None and hasattr(m, 'shape') and len(m.shape) >= 3:
+                max_objects = max(max_objects, m.shape[0] if len(m.shape) == 3 else 1)
+                break
+        colors = get_color_palette(mask_colors, max_objects)
+        if mask_colors:
+            print(f"[SAM3 Video Output] Using custom colors: {mask_colors}")
 
         # Track number of objects for legend
         num_objects = 0
@@ -2276,6 +2285,10 @@ class SAM3VideoTrim:
                     "step": 0.05,
                     "tooltip": "Mask overlay transparency for visualization"
                 }),
+                "mask_colors": ("STRING", {
+                    "default": "",
+                    "tooltip": "Custom mask colors (comma-separated). Names: red, blue, green, yellow, magenta, cyan, orange, purple, pink, lime, teal, coral, gold, navy. Or hex: #FF0000. Order matches object IDs. Empty = default colors."
+                }),
             },
         }
 
@@ -2284,7 +2297,7 @@ class SAM3VideoTrim:
     FUNCTION = "trim_video"
     CATEGORY = "SAM3/video"
 
-    def trim_video(self, video_frames, masks, track_info, scores=None, obj_ids=None, viz_alpha=0.5):
+    def trim_video(self, video_frames, masks, track_info, scores=None, obj_ids=None, viz_alpha=0.5, mask_colors=""):
         """
         Trim video frames and extract masks/visualization for valid frame range.
 
@@ -2327,6 +2340,21 @@ class SAM3VideoTrim:
         trimmed = video_frames[start_frame:end_frame + 1]
         total_frames = trimmed.shape[0]
         h, w = trimmed.shape[1], trimmed.shape[2]
+
+        # Get color palette for visualization
+        from .utils import get_color_palette, DEFAULT_COLORS
+        # Estimate max objects from masks
+        max_objects = 1
+        for frame_idx in range(start_frame, end_frame + 1):
+            if frame_idx in masks:
+                mask_data = masks[frame_idx]
+                if isinstance(mask_data, dict):
+                    m = mask_data.get("mask")
+                else:
+                    m = mask_data
+                if isinstance(m, (torch.Tensor, np.ndarray)) and len(m.shape) >= 3:
+                    max_objects = max(max_objects, m.shape[0])
+        colors = get_color_palette(mask_colors, max_objects)
 
         if early_exit_triggered:
             print(f"[SAM3 VideoTrim] Early exit detected - trimming video")
@@ -2389,7 +2417,7 @@ class SAM3VideoTrim:
                             color_id = frame_obj_ids[obj_idx]
                         else:
                             color_id = obj_idx
-                        color = torch.tensor(self.COLORS[color_id % len(self.COLORS)])
+                        color = torch.tensor(colors[color_id % len(colors)])
 
                         # Add colored overlay to visualization
                         mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
@@ -2407,7 +2435,7 @@ class SAM3VideoTrim:
                         color_id = frame_obj_ids[0]
                     else:
                         color_id = 0
-                    color = torch.tensor(self.COLORS[color_id % len(self.COLORS)])
+                    color = torch.tensor(colors[color_id % len(colors)])
 
                     # Add colored overlay
                     mask_rgb = combined_mask.unsqueeze(-1) * color.view(1, 1, 3)

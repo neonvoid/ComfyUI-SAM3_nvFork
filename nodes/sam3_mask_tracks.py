@@ -340,6 +340,10 @@ class SAM3SelectMask:
                     "step": 0.05,
                     "tooltip": "Mask overlay transparency for visualization (0=invisible, 1=opaque)"
                 }),
+                "mask_colors": ("STRING", {
+                    "default": "",
+                    "tooltip": "Custom mask colors (comma-separated). Names: red, blue, green, yellow, magenta, cyan, orange, purple, pink, lime, teal, coral, gold, navy. Or hex: #FF0000. Order matches object IDs. Empty = default colors."
+                }),
             }
         }
 
@@ -348,11 +352,17 @@ class SAM3SelectMask:
     FUNCTION = "select"
     CATEGORY = "SAM3/video"
 
-    def _create_visualization(self, frames, masks, valid_ids, alpha=0.5):
+    def _create_visualization(self, frames, masks, valid_ids, alpha=0.5, mask_colors=""):
         """Create colored mask overlay on video frames."""
+        from .utils import get_color_palette
+
         num_frames = frames.shape[0]
         h, w = frames.shape[1], frames.shape[2]
         vis_list = []
+
+        # Get color palette based on number of objects
+        num_objects = masks.shape[1] if masks.dim() == 4 else 1
+        colors = get_color_palette(mask_colors, max(num_objects, len(valid_ids)))
 
         for frame_idx in range(num_frames):
             vis_frame = frames[frame_idx].clone()
@@ -365,7 +375,7 @@ class SAM3SelectMask:
                     frame_mask = frame_mask / 255.0
 
                 # Use first color for combined mask
-                color = torch.tensor(self.COLORS[0])
+                color = torch.tensor(colors[0])
                 mask_rgb = frame_mask.unsqueeze(-1) * color.view(1, 1, 3)
                 vis_frame = vis_frame * (1 - alpha * frame_mask.unsqueeze(-1)) + alpha * mask_rgb
 
@@ -377,7 +387,7 @@ class SAM3SelectMask:
                         if obj_mask.max() > 1.0:
                             obj_mask = obj_mask / 255.0
 
-                        color = torch.tensor(self.COLORS[idx % len(self.COLORS)])
+                        color = torch.tensor(colors[idx % len(colors)])
                         mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                         vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
 
@@ -385,7 +395,7 @@ class SAM3SelectMask:
 
         return torch.stack(vis_list, dim=0)
 
-    def select(self, all_masks, object_ids="all", video_frames=None, combine_mode="union", viz_alpha=0.5):
+    def select(self, all_masks, object_ids="all", video_frames=None, combine_mode="union", viz_alpha=0.5, mask_colors=""):
         """
         Select and optionally combine object masks.
         """
@@ -396,7 +406,7 @@ class SAM3SelectMask:
             num_frames, h, w = all_masks.shape
             # Create visualization if frames provided
             if video_frames is not None:
-                visualization = self._create_visualization(video_frames, all_masks, [0], viz_alpha)
+                visualization = self._create_visualization(video_frames, all_masks, [0], viz_alpha, mask_colors)
             else:
                 visualization = torch.zeros(num_frames, h, w, 3)
             return (all_masks, "0", visualization)
@@ -466,9 +476,9 @@ class SAM3SelectMask:
         if video_frames is not None:
             # For visualization, use the selected masks (may be multi-channel if separate)
             if combine_mode == "separate" and selected.dim() == 4:
-                visualization = self._create_visualization(video_frames, selected, list(range(len(valid_ids))), viz_alpha)
+                visualization = self._create_visualization(video_frames, selected, list(range(len(valid_ids))), viz_alpha, mask_colors)
             else:
-                visualization = self._create_visualization(video_frames, selected, valid_ids, viz_alpha)
+                visualization = self._create_visualization(video_frames, selected, valid_ids, viz_alpha, mask_colors)
         else:
             # Return empty visualization with correct shape
             if selected.dim() == 3:
@@ -850,6 +860,10 @@ class SAM3VideoSegmenter:
                     "step": 1,
                     "tooltip": "Extra frames to include after mask presence ends (smoother cuts)"
                 }),
+                "mask_colors": ("STRING", {
+                    "default": "",
+                    "tooltip": "Custom mask colors (comma-separated). Names: red, blue, green, yellow, magenta, cyan, orange, purple, pink, lime, teal, coral, gold, navy. Or hex: #FF0000. Order matches object IDs. Empty = default colors."
+                }),
             }
         }
 
@@ -890,7 +904,7 @@ class SAM3VideoSegmenter:
 
         return frame_np
 
-    def _create_visualization(self, frames, masks, object_ids=None, alpha=0.5, show_ids=True, label_size=24):
+    def _create_visualization(self, frames, masks, object_ids=None, alpha=0.5, show_ids=True, label_size=24, mask_colors=""):
         """
         Create colored mask overlay on video frames with optional ID labels.
 
@@ -901,10 +915,17 @@ class SAM3VideoSegmenter:
             alpha: Mask overlay transparency
             show_ids: Whether to draw ID labels at mask centroids
             label_size: Font size for labels
+            mask_colors: Custom color string for visualization
         """
+        from .utils import get_color_palette
+
         num_frames = frames.shape[0]
         h, w = frames.shape[1], frames.shape[2]
         vis_list = []
+
+        # Get color palette based on number of objects
+        num_objects = masks.shape[1] if masks.dim() == 4 else 1
+        colors = get_color_palette(mask_colors, num_objects)
 
         for frame_idx in range(num_frames):
             vis_frame = frames[frame_idx].clone()
@@ -919,7 +940,7 @@ class SAM3VideoSegmenter:
                     if obj_mask.max() > 1.0:
                         obj_mask = obj_mask / 255.0
 
-                    color = torch.tensor(self.COLORS[obj_idx % len(self.COLORS)])
+                    color = torch.tensor(colors[obj_idx % len(colors)])
                     mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                     vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
 
@@ -944,7 +965,7 @@ class SAM3VideoSegmenter:
                                 if len(y_coords) > 0:
                                     cy = float(y_coords.float().mean())
                                     cx = float(x_coords.float().mean())
-                                    color = self.COLORS[obj_idx % len(self.COLORS)]
+                                    color = colors[obj_idx % len(colors)]
                                     frame_np = self._draw_text(
                                         frame_np, f"ID:{obj_id}",
                                         cx, cy, color, label_size
@@ -959,7 +980,7 @@ class SAM3VideoSegmenter:
                 if obj_mask.max() > 1.0:
                     obj_mask = obj_mask / 255.0
 
-                color = torch.tensor(self.COLORS[0])
+                color = torch.tensor(colors[0])
                 mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                 vis_frame = vis_frame * (1 - alpha * obj_mask.unsqueeze(-1)) + alpha * mask_rgb
                 vis_frame = vis_frame.clamp(0, 1)
@@ -978,7 +999,8 @@ class SAM3VideoSegmenter:
         show_ids=True,
         label_size=24,
         margin_head=0,
-        margin_tail=0
+        margin_tail=0,
+        mask_colors=""
     ):
         """
         Extract video segment and masks for a specific batch.
@@ -1068,7 +1090,8 @@ class SAM3VideoSegmenter:
             object_ids=valid_ids,
             alpha=viz_alpha,
             show_ids=show_ids,
-            label_size=label_size
+            label_size=label_size,
+            mask_colors=mask_colors
         )
 
         # Squeeze single-object masks to [N, H, W] for ComfyUI compatibility

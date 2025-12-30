@@ -19,12 +19,12 @@ class SAM3PresetSave:
     """
     Save SAM3 point markers and settings to a JSON preset file.
 
-    Takes the output from SAM3PointCollector (points_store) plus start frame
+    Takes the output from SAM3PointCollector (positive_points) plus start frame
     and colors, and saves everything to a reusable preset file.
 
     Workflow:
     1. Use SAM3PointCollector to mark players on a frame
-    2. Connect points_store to this node
+    2. Connect positive_points output to this node
     3. Set start_frame and mask_colors
     4. Run to save the preset
 
@@ -40,15 +40,18 @@ class SAM3PresetSave:
                     "multiline": False,
                     "tooltip": "Name for the preset file (without .json extension)"
                 }),
-                "points_store": ("STRING", {
-                    "multiline": True,
-                    "default": "{}",
-                    "tooltip": "JSON from SAM3PointCollector's points_store output. Copy the widget value here."
+                "positive_points": ("SAM3_POINTS_PROMPT", {
+                    "tooltip": "Connect to SAM3PointCollector's positive_points output"
                 }),
-                "start_frame": ("INT", {
+                "start_frame_forward": ("INT", {
                     "default": 0,
                     "min": 0,
-                    "tooltip": "Frame index where markers were placed / tracking should start"
+                    "tooltip": "Frame index to start forward tracking from"
+                }),
+                "start_frame_backward": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "tooltip": "Frame index to start backward tracking from (usually same as forward or end of clip)"
                 }),
                 "mask_colors": ("STRING", {
                     "default": "cyan, teal, purple, magenta",
@@ -57,6 +60,14 @@ class SAM3PresetSave:
                 }),
             },
             "optional": {
+                "negative_points": ("SAM3_POINTS_PROMPT", {
+                    "tooltip": "Optional: Connect to SAM3PointCollector's negative_points output"
+                }),
+                "output_directory": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Custom directory to save presets. Leave empty for default (output/sam3_presets)"
+                }),
                 "video_path": ("STRING", {
                     "default": "",
                     "multiline": False,
@@ -79,33 +90,44 @@ class SAM3PresetSave:
     def save_preset(
         self,
         preset_name: str,
-        points_store: str,
-        start_frame: int,
+        positive_points: dict,
+        start_frame_forward: int,
+        start_frame_backward: int,
         mask_colors: str,
+        negative_points: dict = None,
+        output_directory: str = "",
         video_path: str = "",
         notes: str = ""
     ):
         """Save markers and settings to a JSON preset file."""
 
-        # Parse points_store JSON
-        try:
-            points_data = json.loads(points_store) if points_store.strip() else {}
-        except json.JSONDecodeError as e:
-            return ("", f"Error: Invalid points_store JSON - {e}")
+        # Handle multi-object format (from SAM3PointCollector multi-object mode)
+        if "objects" in positive_points:
+            objects = positive_points["objects"]
+        else:
+            # Legacy single-object format - convert to multi-object
+            pos_pts = positive_points.get("points", [])
+            neg_pts = []
+            if negative_points and "points" in negative_points:
+                neg_pts = negative_points["points"]
+
+            objects = [{
+                "obj_id": 1,
+                "positive_points": pos_pts,
+                "negative_points": neg_pts
+            }] if pos_pts else []
 
         # Validate we have objects
-        objects = points_data.get("objects", [])
         if not objects:
-            # Check for legacy format
-            if "points" in points_data or "labels" in points_data:
-                return ("", "Error: Legacy single-object format detected. Use multi-object mode in SAM3PointCollector.")
-            return ("", "Error: No objects found in points_store. Mark some players first!")
+            return ("", "Error: No objects found. Mark some players first!")
 
         # Build preset data
         preset = {
-            "version": "1.0",
+            "version": "1.1",
             "preset_name": preset_name,
-            "start_frame": start_frame,
+            "start_frame_forward": start_frame_forward,
+            "start_frame_backward": start_frame_backward,
+            "start_frame": start_frame_forward,  # Legacy compatibility
             "mask_colors": mask_colors,
             "video_path": video_path,
             "notes": notes,
@@ -114,7 +136,10 @@ class SAM3PresetSave:
         }
 
         # Determine save path
-        presets_dir = os.path.join(folder_paths.get_output_directory(), "sam3_presets")
+        if output_directory and output_directory.strip():
+            presets_dir = output_directory.strip()
+        else:
+            presets_dir = os.path.join(folder_paths.get_output_directory(), "sam3_presets")
         os.makedirs(presets_dir, exist_ok=True)
 
         # Clean preset name
@@ -139,7 +164,7 @@ class SAM3PresetSave:
         status = (
             f"Saved preset: {preset_name}\n"
             f"Path: {preset_path}\n"
-            f"Start frame: {start_frame}\n"
+            f"Start frame (fwd): {start_frame_forward}, (bwd): {start_frame_backward}\n"
             f"Colors: {mask_colors}\n"
             f"Objects ({len(objects)}): {', '.join(obj_summary)}"
         )
@@ -155,71 +180,56 @@ class SAM3PresetLoad:
 
     Outputs the data needed to feed into the SAM3 video tracking pipeline:
     - positive_points: Multi-object points prompt for SAM3AddVideoPrompt
-    - start_frame: Frame index to start tracking
+    - negative_points: Negative points prompt (if any were saved)
+    - start_frame_forward: Frame index to start forward tracking
+    - start_frame_backward: Frame index to start backward tracking
     - mask_colors: Color string for visualization
 
     Workflow:
-    1. Point this node at a preset JSON file
+    1. Point this node at a preset JSON file via preset_path
     2. Connect outputs to your tracking workflow
     3. Process multiple presets in batch using a loop or queue
     """
 
     @classmethod
     def INPUT_TYPES(cls):
-        # Get list of existing presets
-        presets_dir = os.path.join(folder_paths.get_output_directory(), "sam3_presets")
-        preset_files = []
-        if os.path.exists(presets_dir):
-            preset_files = [f for f in os.listdir(presets_dir) if f.endswith('.json')]
-
         return {
             "required": {
-                "preset_file": (preset_files if preset_files else ["no_presets_found.json"], {
-                    "tooltip": "Select a preset file to load"
-                }),
-            },
-            "optional": {
-                "custom_path": ("STRING", {
+                "preset_path": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "tooltip": "Optional: Full path to preset file (overrides dropdown)"
+                    "tooltip": "Full path to preset JSON file"
                 }),
-            }
+            },
         }
 
-    RETURN_TYPES = ("SAM3_POINTS_PROMPT", "INT", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("positive_points", "start_frame", "mask_colors", "video_path", "preset_info")
+    RETURN_TYPES = ("SAM3_POINTS_PROMPT", "SAM3_POINTS_PROMPT", "INT", "INT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("positive_points", "negative_points", "start_frame_forward", "start_frame_backward", "mask_colors", "video_path", "preset_info")
     FUNCTION = "load_preset"
     CATEGORY = "SAM3/presets"
 
     @classmethod
-    def IS_CHANGED(cls, preset_file, custom_path=""):
+    def IS_CHANGED(cls, preset_path):
         # Check file modification time
-        if custom_path and os.path.exists(custom_path):
-            return os.path.getmtime(custom_path)
-
-        presets_dir = os.path.join(folder_paths.get_output_directory(), "sam3_presets")
-        preset_path = os.path.join(presets_dir, preset_file)
-        if os.path.exists(preset_path):
+        if preset_path and os.path.exists(preset_path):
             return os.path.getmtime(preset_path)
-
         return float("nan")
 
-    def load_preset(self, preset_file: str, custom_path: str = ""):
+    def load_preset(self, preset_path: str):
         """Load markers and settings from a JSON preset file."""
 
-        # Determine path
-        if custom_path and custom_path.strip():
-            preset_path = custom_path.strip()
-        else:
-            presets_dir = os.path.join(folder_paths.get_output_directory(), "sam3_presets")
-            preset_path = os.path.join(presets_dir, preset_file)
-
         # Check file exists
+        if not preset_path or not preset_path.strip():
+            print(f"[SAM3 PresetLoad] Error: No preset path provided")
+            empty_prompt = {"objects": []}
+            return (empty_prompt, empty_prompt, 0, 0, "", "", "Error: No preset path provided")
+
+        preset_path = preset_path.strip()
+
         if not os.path.exists(preset_path):
             print(f"[SAM3 PresetLoad] Error: Preset file not found: {preset_path}")
             empty_prompt = {"objects": []}
-            return (empty_prompt, 0, "", "", f"Error: File not found: {preset_path}")
+            return (empty_prompt, empty_prompt, 0, 0, "", "", f"Error: File not found: {preset_path}")
 
         # Load preset
         try:
@@ -228,11 +238,14 @@ class SAM3PresetLoad:
         except Exception as e:
             print(f"[SAM3 PresetLoad] Error loading preset: {e}")
             empty_prompt = {"objects": []}
-            return (empty_prompt, 0, "", "", f"Error loading: {e}")
+            return (empty_prompt, empty_prompt, 0, 0, "", "", f"Error loading: {e}")
 
         # Extract data
         preset_name = preset.get("preset_name", "unknown")
-        start_frame = preset.get("start_frame", 0)
+        # Support both new format (start_frame_forward/backward) and legacy (start_frame)
+        legacy_start = preset.get("start_frame", 0)
+        start_frame_forward = preset.get("start_frame_forward", legacy_start)
+        start_frame_backward = preset.get("start_frame_backward", legacy_start)
         mask_colors = preset.get("mask_colors", "cyan, teal, purple, magenta")
         video_path = preset.get("video_path", "")
         notes = preset.get("notes", "")
@@ -241,6 +254,18 @@ class SAM3PresetLoad:
         # Build positive_points output (multi-object format)
         # This matches SAM3PointCollector's multi-object output format
         positive_points = {"objects": objects}
+
+        # Build negative_points output (extract negative points from each object)
+        negative_objects = []
+        for obj in objects:
+            neg_pts = obj.get("negative_points", [])
+            if neg_pts:
+                negative_objects.append({
+                    "obj_id": obj.get("obj_id", 1),
+                    "positive_points": [],  # No positive points in negative output
+                    "negative_points": neg_pts
+                })
+        negative_points = {"objects": negative_objects}
 
         # Build info string
         obj_summary = []
@@ -252,18 +277,18 @@ class SAM3PresetLoad:
 
         preset_info = (
             f"Preset: {preset_name}\n"
-            f"Start frame: {start_frame}\n"
+            f"Start frame (fwd): {start_frame_forward}, (bwd): {start_frame_backward}\n"
             f"Colors: {mask_colors}\n"
             f"Objects ({len(objects)}): {', '.join(obj_summary)}\n"
             f"Notes: {notes}"
         )
 
         print(f"[SAM3 PresetLoad] Loaded preset: {preset_name}")
-        print(f"[SAM3 PresetLoad]   Start frame: {start_frame}")
+        print(f"[SAM3 PresetLoad]   Start frame (fwd): {start_frame_forward}, (bwd): {start_frame_backward}")
         print(f"[SAM3 PresetLoad]   Objects: {len(objects)}")
         print(f"[SAM3 PresetLoad]   Colors: {mask_colors}")
 
-        return (positive_points, start_frame, mask_colors, video_path, preset_info)
+        return (positive_points, negative_points, start_frame_forward, start_frame_backward, mask_colors, video_path, preset_info)
 
 
 class SAM3PresetBatchLoader:
@@ -291,7 +316,7 @@ class SAM3PresetBatchLoader:
                 }),
             },
             "optional": {
-                "presets_directory": ("STRING", {
+                "input_directory": ("STRING", {
                     "default": "",
                     "multiline": False,
                     "tooltip": "Directory containing preset files. Leave empty for default (output/sam3_presets)"
@@ -310,17 +335,17 @@ class SAM3PresetBatchLoader:
     CATEGORY = "SAM3/presets"
 
     @classmethod
-    def IS_CHANGED(cls, batch_index, presets_directory="", file_pattern="*.json"):
+    def IS_CHANGED(cls, batch_index, input_directory="", file_pattern="*.json"):
         # Always re-run to check for new presets
         return float("nan")
 
-    def load_batch(self, batch_index: int, presets_directory: str = "", file_pattern: str = "*.json"):
+    def load_batch(self, batch_index: int, input_directory: str = "", file_pattern: str = "*.json"):
         """Load a specific preset by batch index."""
         import glob
 
         # Determine directory
-        if presets_directory and presets_directory.strip():
-            presets_dir = presets_directory.strip()
+        if input_directory and input_directory.strip():
+            presets_dir = input_directory.strip()
         else:
             presets_dir = os.path.join(folder_paths.get_output_directory(), "sam3_presets")
 

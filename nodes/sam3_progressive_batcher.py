@@ -127,31 +127,141 @@ class SAM3ProgressiveBatcher:
             }
         }
 
-    RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SCORES", "STRING", "INT", "STRING")
-    RETURN_NAMES = ("masks", "scores", "batch_schedule", "num_batches", "track_info")
+    RETURN_TYPES = ("MASK", "STRING", "STRING", "INT", "STRING")
+    RETURN_NAMES = ("all_masks", "track_info", "batch_schedule", "num_batches", "object_ids")
     FUNCTION = "progressive_batch"
     CATEGORY = "SAM3/video"
+
+    def _convert_masks_to_tensor(
+        self,
+        mask_dict: Dict[int, dict],
+        num_frames: int,
+        height: int,
+        width: int,
+        all_obj_ids: Set[int]
+    ) -> Tuple[torch.Tensor, Dict[int, dict]]:
+        """
+        Convert mask dictionary to tensor format [N_frames, N_objects, H, W].
+
+        Also builds per-object visibility info similar to SAM3MaskTracks.
+        """
+        # Create sorted list of object IDs for consistent ordering
+        obj_id_list = sorted(all_obj_ids)
+        num_objects = len(obj_id_list)
+        obj_id_to_idx = {obj_id: idx for idx, obj_id in enumerate(obj_id_list)}
+
+        if num_objects == 0:
+            print("[SAM3 ProgressiveBatcher] No objects found, returning empty tensor")
+            return torch.zeros(num_frames, 1, height, width), {}
+
+        print(f"[SAM3 ProgressiveBatcher] Converting masks to tensor: {num_frames} frames, {num_objects} objects")
+
+        # Initialize output tensor
+        all_masks = torch.zeros(num_frames, num_objects, height, width)
+
+        # Track per-object visibility
+        object_info = {
+            obj_id: {
+                "first_frame": None,
+                "last_frame": None,
+                "visible_frames": 0,
+            }
+            for obj_id in obj_id_list
+        }
+
+        # Fill tensor from dictionary
+        for frame_idx, frame_data in mask_dict.items():
+            if frame_idx >= num_frames:
+                continue
+
+            mask_tensor = frame_data.get("mask")
+            frame_obj_ids = frame_data.get("obj_ids", [])
+
+            if mask_tensor is None:
+                continue
+
+            # Convert numpy to torch if needed
+            if isinstance(mask_tensor, np.ndarray):
+                mask_tensor = torch.from_numpy(mask_tensor)
+
+            if hasattr(mask_tensor, 'cpu'):
+                mask_tensor = mask_tensor.cpu()
+
+            # Handle different mask shapes
+            for local_idx, obj_id in enumerate(frame_obj_ids):
+                if obj_id not in obj_id_to_idx:
+                    continue
+
+                tensor_idx = obj_id_to_idx[obj_id]
+
+                # Extract mask for this object
+                if mask_tensor.ndim == 4:
+                    # [1, num_objects, H, W]
+                    if local_idx < mask_tensor.shape[1]:
+                        obj_mask = mask_tensor[0, local_idx].float()
+                    else:
+                        continue
+                elif mask_tensor.ndim == 3:
+                    # [num_objects, H, W]
+                    if local_idx < mask_tensor.shape[0]:
+                        obj_mask = mask_tensor[local_idx].float()
+                    else:
+                        continue
+                elif mask_tensor.ndim == 2:
+                    # [H, W] - single object
+                    obj_mask = mask_tensor.float()
+                else:
+                    continue
+
+                # Normalize to [0, 1] if needed
+                if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
+                    obj_mask = obj_mask / 255.0
+
+                # Resize if needed
+                if obj_mask.shape[0] != height or obj_mask.shape[1] != width:
+                    obj_mask = torch.nn.functional.interpolate(
+                        obj_mask.unsqueeze(0).unsqueeze(0),
+                        size=(height, width),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0).squeeze(0)
+
+                all_masks[frame_idx, tensor_idx] = obj_mask
+
+                # Track visibility
+                pixel_count = (obj_mask > 0.5).sum().item()
+                if pixel_count >= 100:  # min_visible_pixels
+                    if object_info[obj_id]["first_frame"] is None:
+                        object_info[obj_id]["first_frame"] = frame_idx
+                    object_info[obj_id]["last_frame"] = frame_idx
+                    object_info[obj_id]["visible_frames"] += 1
+
+        return all_masks, object_info
 
     def _get_mask_for_object(self, mask_tensor, obj_idx: int) -> torch.Tensor:
         """Extract mask for a specific object from the mask tensor."""
         if mask_tensor is None:
             return torch.zeros(1)
 
+        # Convert numpy array to torch tensor
+        if isinstance(mask_tensor, np.ndarray):
+            mask_tensor = torch.from_numpy(mask_tensor)
+
         if hasattr(mask_tensor, 'cpu'):
             mask_tensor = mask_tensor.cpu()
 
         # Handle different mask shapes
-        if mask_tensor.dim() == 4:
+        if mask_tensor.ndim == 4:
             # [1, num_objects, H, W] - batch dim present
             if obj_idx < mask_tensor.shape[1]:
                 return mask_tensor[0, obj_idx]
             return torch.zeros(mask_tensor.shape[2:])
-        elif mask_tensor.dim() == 3:
+        elif mask_tensor.ndim == 3:
             # [num_objects, H, W]
             if obj_idx < mask_tensor.shape[0]:
                 return mask_tensor[obj_idx]
             return torch.zeros(mask_tensor.shape[1:])
-        elif mask_tensor.dim() == 2:
+        elif mask_tensor.ndim == 2:
             # [H, W] - single object
             return mask_tensor if obj_idx == 0 else torch.zeros_like(mask_tensor)
 
@@ -317,17 +427,21 @@ class SAM3ProgressiveBatcher:
                                 mask_tensor = mask_tensor.cpu()
                             break
 
+                    # Convert numpy to torch if needed
+                    if mask_tensor is not None and isinstance(mask_tensor, np.ndarray):
+                        mask_tensor = torch.from_numpy(mask_tensor)
+
                     # Extract object IDs from response
                     current_obj_ids = set()
                     if "obj_ids" in outputs:
                         current_obj_ids = set(outputs["obj_ids"])
                     elif mask_tensor is not None:
                         # Infer from mask shape
-                        if mask_tensor.dim() == 4:
+                        if mask_tensor.ndim == 4:
                             current_obj_ids = set(range(mask_tensor.shape[1]))
-                        elif mask_tensor.dim() == 3:
+                        elif mask_tensor.ndim == 3:
                             current_obj_ids = set(range(mask_tensor.shape[0]))
-                        elif mask_tensor.dim() == 2:
+                        elif mask_tensor.ndim == 2:
                             current_obj_ids = {0}
 
                     # Track entries (new objects appearing)
@@ -460,6 +574,16 @@ class SAM3ProgressiveBatcher:
             }
         }
 
+        # Convert masks from dict to tensor format [N_frames, N_objects, H, W]
+        h, w = video_state.height, video_state.width
+        masks_tensor, tensor_obj_info = self._convert_masks_to_tensor(
+            mask_dict=all_masks,
+            num_frames=total_frames,
+            height=h,
+            width=w,
+            all_obj_ids=all_obj_ids_ever
+        )
+
         # Build track info for per-object details
         track_info = {
             "objects": [
@@ -472,15 +596,21 @@ class SAM3ProgressiveBatcher:
                 for obj_id in sorted(all_obj_ids_ever)
             ],
             "total_frames": total_frames,
-            "total_objects": len(all_obj_ids_ever)
+            "total_objects": len(all_obj_ids_ever),
+            "dimensions": {"height": h, "width": w}
         }
 
+        # Build object IDs string for downstream nodes
+        object_ids_str = ",".join(str(obj_id) for obj_id in sorted(all_obj_ids_ever))
+
+        print(f"[SAM3 ProgressiveBatcher] Output tensor shape: {masks_tensor.shape}")
+
         return (
-            all_masks,
-            all_scores,
+            masks_tensor,
+            json.dumps(track_info, indent=2),
             json.dumps(schedule, indent=2),
             len(batches),
-            json.dumps(track_info, indent=2)
+            object_ids_str
         )
 
 

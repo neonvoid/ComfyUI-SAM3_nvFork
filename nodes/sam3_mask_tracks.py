@@ -514,9 +514,9 @@ class SAM3BatchPlanner:
                 }),
             },
             "optional": {
-                "batch_mode": (["by_stability", "temporal"], {
+                "batch_mode": (["by_stability", "temporal", "overlap_optimized"], {
                     "default": "by_stability",
-                    "tooltip": "by_stability: group by visibility/score. temporal: group by co-occurrence (who's on screen together)"
+                    "tooltip": "by_stability: group by visibility/score. temporal: group by co-occurrence. overlap_optimized: group by maximum overlap efficiency (players visible together for longest time)"
                 }),
                 "max_objects_per_batch": ("INT", {
                     "default": 4,
@@ -542,6 +542,13 @@ class SAM3BatchPlanner:
                 "sort_by": (["visible_frames", "avg_score", "first_frame"], {
                     "default": "visible_frames",
                     "tooltip": "Sort priority (by_stability mode): most visible first, highest score first, or temporal order"
+                }),
+                "min_overlap_frames": ("INT", {
+                    "default": 15,
+                    "min": 1,
+                    "max": 300,
+                    "step": 5,
+                    "tooltip": "Minimum frames of overlap required to batch players together (overlap_optimized mode). ~0.5s at 30fps."
                 }),
                 "batch_index": ("INT", {
                     "default": 0,
@@ -648,6 +655,97 @@ class SAM3BatchPlanner:
 
         return batches
 
+    def _overlap_optimized_batching(self, objects, max_per_batch, min_overlap_frames):
+        """
+        Group objects by maximum overlap efficiency.
+
+        Creates batches where all objects in each batch are visible together
+        for the longest possible time. Each batch's frame range is the tight
+        overlap window where ALL batch members are present.
+
+        This is optimal for workflows where:
+        - Different objects have very different screen times
+        - You want to minimize wasted processing (only process frames where all batch objects exist)
+        - Objects with long durations should be isolated rather than "wasting" their frames
+        """
+        from itertools import combinations
+
+        if not objects:
+            return []
+
+        # Get player presence windows: (id, first_frame, last_frame)
+        players = [(obj["id"], obj["first_frame"], obj["last_frame"]) for obj in objects]
+
+        # Print duration analysis
+        print(f"[SAM3 BatchPlanner] Player duration analysis:")
+        for p in sorted(players, key=lambda x: x[2]):  # Sort by exit time
+            duration = p[2] - p[1]
+            print(f"[SAM3 BatchPlanner]   Player {p[0]}: frames {p[1]}-{p[2]} (duration: {duration} frames)")
+
+        def get_overlap(player_subset):
+            """Calculate overlap window for a set of players."""
+            if not player_subset:
+                return None, 0
+            start = max(p[1] for p in player_subset)  # Latest entry
+            end = min(p[2] for p in player_subset)    # Earliest exit
+            if end <= start:
+                return None, 0
+            return (start, end), end - start
+
+        # Greedy batch assignment
+        unassigned = set(range(len(players)))
+        batches = []
+
+        while unassigned:
+            best_batch = None
+            best_score = 0
+            best_window = None
+
+            # Try all combinations up to max_per_batch
+            # Start with larger groups (prefer grouping when possible)
+            for size in range(min(len(unassigned), max_per_batch), 0, -1):
+                for combo in combinations(unassigned, size):
+                    subset = [players[i] for i in combo]
+                    window, overlap = get_overlap(subset)
+
+                    if overlap >= min_overlap_frames:
+                        # Score: overlap duration * small bonus for larger groups
+                        # This prefers grouping players together when overlap is similar
+                        score = overlap * (1 + 0.1 * len(combo))
+                        if score > best_score:
+                            best_score = score
+                            best_batch = combo
+                            best_window = window
+
+            if best_batch:
+                # Create batch with calculated frame range
+                batch_ids = [players[i][0] for i in best_batch]
+                batches.append({
+                    "batch_index": len(batches),
+                    "object_ids": batch_ids,
+                    "start_frame": best_window[0],
+                    "end_frame": best_window[1],
+                    "object_count": len(batch_ids),
+                    "overlap_frames": best_window[1] - best_window[0]
+                })
+                unassigned -= set(best_batch)
+            else:
+                # No valid overlap found - assign remaining players individually
+                print(f"[SAM3 BatchPlanner] No valid overlaps found for remaining {len(unassigned)} players, creating individual batches")
+                for i in sorted(unassigned):
+                    p = players[i]
+                    batches.append({
+                        "batch_index": len(batches),
+                        "object_ids": [p[0]],
+                        "start_frame": p[1],
+                        "end_frame": p[2],
+                        "object_count": 1,
+                        "overlap_frames": p[2] - p[1]
+                    })
+                break
+
+        return batches
+
     def plan_batches(
         self,
         track_info,
@@ -656,14 +754,16 @@ class SAM3BatchPlanner:
         min_visible_frames=30,
         min_visibility_ratio=0.1,
         sort_by="visible_frames",
+        min_overlap_frames=15,
         batch_index=0
     ):
         """
         Parse track_info, filter noise, and generate batch schedule.
 
-        Two modes available:
+        Three modes available:
         - by_stability: Group by visibility/score, process all frames for each batch
         - temporal: Group by co-occurrence, each batch processes only its time window
+        - overlap_optimized: Group by maximum overlap efficiency (tight frame ranges where all batch members present)
         """
         # Parse JSON
         try:
@@ -728,6 +828,9 @@ class SAM3BatchPlanner:
         if batch_mode == "temporal":
             print(f"[SAM3 BatchPlanner] Using temporal co-occurrence batching")
             batches = self._temporal_batching(filtered, max_objects_per_batch, total_frames)
+        elif batch_mode == "overlap_optimized":
+            print(f"[SAM3 BatchPlanner] Using overlap-optimized batching (min_overlap={min_overlap_frames} frames)")
+            batches = self._overlap_optimized_batching(filtered, max_objects_per_batch, min_overlap_frames)
         else:
             print(f"[SAM3 BatchPlanner] Using stability batching, sorted by {sort_by}")
             batches = self._stability_batching(filtered, max_objects_per_batch, sort_by)
@@ -738,7 +841,8 @@ class SAM3BatchPlanner:
         print(f"[SAM3 BatchPlanner] Created {num_batches} batches:")
         for batch in batches:
             ids_str = ",".join(str(i) for i in batch["object_ids"])
-            print(f"[SAM3 BatchPlanner]   Batch {batch['batch_index']}: Objects [{ids_str}], frames {batch['start_frame']}-{batch['end_frame']}")
+            overlap_str = f" ({batch['overlap_frames']} overlap)" if "overlap_frames" in batch else ""
+            print(f"[SAM3 BatchPlanner]   Batch {batch['batch_index']}: Objects [{ids_str}], frames {batch['start_frame']}-{batch['end_frame']}{overlap_str}")
 
         # Build full schedule JSON
         schedule = {

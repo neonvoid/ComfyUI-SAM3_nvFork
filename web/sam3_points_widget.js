@@ -268,34 +268,39 @@ app.registerExtension({
                 console.log("[SAM3] All widgets processing complete");
 
                 // Mouse event handlers
+                // Left-click = positive point
+                // Shift+click or Ctrl+click = negative point
+                // Alt+click on existing point = delete
                 canvas.addEventListener("click", (e) => {
+                    e.stopPropagation();
                     const rect = canvas.getBoundingClientRect();
-                    // Calculate coordinates relative to the actual image dimensions
-                    // The canvas might be scaled, so we need to map from display coords to image coords
                     const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
                     const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
                     console.log(`[SAM3] Click at canvas coords: (${x.toFixed(1)}, ${y.toFixed(1)}), canvas size: ${canvas.width}x${canvas.height}`);
 
                     const currentObj = this.canvasWidget.objects[this.canvasWidget.currentObjectIndex];
 
-                    // Check if clicking existing point to delete
+                    // Check if clicking existing point to delete (Alt+click)
                     const clickedPoint = this.findPointAt(x, y);
-                    if (clickedPoint && e.button === 2) {
-                        // Right-click on existing point = delete
+                    if (clickedPoint && e.altKey) {
+                        // Alt+click on existing point = delete
                         const obj = this.canvasWidget.objects[clickedPoint.objectIndex];
                         if (clickedPoint.type === 'positive') {
                             obj.positivePoints = obj.positivePoints.filter(p => p !== clickedPoint.point);
                         } else {
                             obj.negativePoints = obj.negativePoints.filter(p => p !== clickedPoint.point);
                         }
+                        console.log(`[SAM3] Deleted ${clickedPoint.type} point from object ${clickedPoint.objectIndex + 1}`);
                     } else {
                         // Add new point to current object
-                        if (e.shiftKey || e.button === 2) {
-                            // Negative point
+                        if (e.shiftKey || e.ctrlKey) {
+                            // Shift+click or Ctrl+click = Negative point
                             currentObj.negativePoints.push({x, y});
+                            console.log(`[SAM3] Added negative point to object ${this.canvasWidget.currentObjectIndex + 1}`);
                         } else {
-                            // Positive point
+                            // Left-click = Positive point
                             currentObj.positivePoints.push({x, y});
+                            console.log(`[SAM3] Added positive point to object ${this.canvasWidget.currentObjectIndex + 1}`);
                         }
                     }
 
@@ -304,15 +309,10 @@ app.registerExtension({
                     this.redrawCanvas();
                 });
 
+                // Prevent context menu on canvas (just block it, don't use for points)
                 canvas.addEventListener("contextmenu", (e) => {
                     e.preventDefault();
-                    // Trigger click with right button flag
-                    canvas.dispatchEvent(new MouseEvent('click', {
-                        button: 2,
-                        clientX: e.clientX,
-                        clientY: e.clientY,
-                        shiftKey: e.shiftKey
-                    }));
+                    e.stopPropagation();
                 });
 
                 canvas.addEventListener("mousemove", (e) => {

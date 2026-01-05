@@ -1964,18 +1964,21 @@ class SAM3VideoOutput:
                     "default": "",
                     "tooltip": "Custom mask colors (comma-separated). Names: red, blue, green, yellow, magenta, cyan, orange, purple, pink, lime, teal, coral, gold, navy. Or hex: #FF0000. Order matches object IDs. Empty = default colors."
                 }),
+                "previous_visualization": ("IMAGE", {
+                    "tooltip": "Previous debug video to overlay new masks onto (for accumulating tracked players across runs)"
+                }),
             }
         }
 
     @classmethod
-    def IS_CHANGED(cls, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True, mask_colors=""):
+    def IS_CHANGED(cls, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True, mask_colors="", previous_visualization=None):
         # Always re-run this node when params change, but this is cheap
         # The key is that changing these here does NOT invalidate upstream cache
         # ComfyUI caches based on input values - masks/video_state don't change
-        return (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend, mask_colors)
+        return (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend, mask_colors, id(previous_visualization))
 
-    RETURN_TYPES = ("MASK", "IMAGE", "IMAGE")
-    RETURN_NAMES = ("masks", "frames", "visualization")
+    RETURN_TYPES = ("MASK", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("masks", "frames", "visualization", "accumulated_visualization")
     FUNCTION = "extract"
     CATEGORY = "SAM3/video"
 
@@ -2031,14 +2034,14 @@ class SAM3VideoOutput:
 
         return vis_frame
 
-    def extract(self, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True, mask_colors=""):
+    def extract(self, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True, mask_colors="", previous_visualization=None):
         """Extract all masks as a batch [N, H, W]."""
         from PIL import Image
         import os
         from .utils import get_color_palette, DEFAULT_COLORS
 
         # Create cache key
-        cache_key = (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend, mask_colors)
+        cache_key = (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend, mask_colors, id(previous_visualization))
 
         # Check if we have cached result
         if cache_key in SAM3VideoOutput._cache:
@@ -2054,12 +2057,13 @@ class SAM3VideoOutput:
             print("[SAM3 Video] No masks to extract")
             empty_mask = torch.zeros(num_frames, h, w)
             empty_frames = torch.zeros(num_frames, h, w, 3)
-            return (empty_mask, empty_frames, empty_frames)
+            return (empty_mask, empty_frames, empty_frames, empty_frames)
 
         # Process all frames in order
         mask_list = []
         frame_list = []
         vis_list = []
+        accumulated_vis_list = []
 
         # Get color palette - user colors first, then defaults
         # Estimate max objects from first available mask
@@ -2117,6 +2121,12 @@ class SAM3VideoOutput:
                 # Create visualization with colored overlays
                 vis_frame = img_tensor.clone()
 
+                # Create accumulated visualization (overlay on previous or original)
+                if previous_visualization is not None and frame_idx < previous_visualization.shape[0]:
+                    accumulated_vis_frame = previous_visualization[frame_idx].clone()
+                else:
+                    accumulated_vis_frame = img_tensor.clone()
+
                 # Get object IDs for stable color mapping
                 # Priority: embedded obj_ids > separate obj_ids input > array index fallback
                 frame_obj_ids = embedded_obj_ids
@@ -2146,6 +2156,7 @@ class SAM3VideoOutput:
                             color = torch.tensor(colors[color_id % len(colors)])
                             mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                             vis_frame = vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
+                            accumulated_vis_frame = accumulated_vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
                             combined_mask = torch.max(combined_mask, obj_mask)
                     else:
                         # Show only selected obj_id
@@ -2161,6 +2172,7 @@ class SAM3VideoOutput:
                         color = torch.tensor(colors[color_id % len(colors)])
                         mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                         vis_frame = vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
+                        accumulated_vis_frame = accumulated_vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
                         # Still compute combined for mask output
                         for oid in range(frame_mask.shape[0]):
                             om = frame_mask[oid].float()
@@ -2183,6 +2195,7 @@ class SAM3VideoOutput:
                     color = torch.tensor(colors[0])
                     mask_rgb = frame_mask.unsqueeze(-1) * color.view(1, 1, 3)
                     vis_frame = vis_frame * (1 - 0.5 * frame_mask.unsqueeze(-1)) + 0.5 * mask_rgb
+                    accumulated_vis_frame = accumulated_vis_frame * (1 - 0.5 * frame_mask.unsqueeze(-1)) + 0.5 * mask_rgb
 
                 # Final check for empty masks
                 if frame_mask.numel() == 0:
@@ -2203,12 +2216,19 @@ class SAM3VideoOutput:
                         elif hasattr(frame_scores_tensor, '__iter__'):
                             frame_scores = list(frame_scores_tensor)
                     vis_frame = self._draw_legend(vis_frame, num_objects, colors, obj_id=legend_obj_id, frame_scores=frame_scores)
+                    accumulated_vis_frame = self._draw_legend(accumulated_vis_frame, num_objects, colors, obj_id=legend_obj_id, frame_scores=frame_scores)
 
                 vis_list.append(vis_frame.clamp(0, 1))
+                accumulated_vis_list.append(accumulated_vis_frame.clamp(0, 1))
             else:
                 # No mask for this frame - use zeros
                 frame_mask = torch.zeros(h, w)
                 vis_list.append(img_tensor)
+                # For accumulated, use previous visualization if available, else original
+                if previous_visualization is not None and frame_idx < previous_visualization.shape[0]:
+                    accumulated_vis_list.append(previous_visualization[frame_idx])
+                else:
+                    accumulated_vis_list.append(img_tensor)
 
             mask_list.append(frame_mask.cpu())
 
@@ -2216,13 +2236,16 @@ class SAM3VideoOutput:
         all_masks = torch.stack(mask_list, dim=0)  # [N, H, W]
         all_frames = torch.stack(frame_list, dim=0)  # [N, H, W, C]
         all_vis = torch.stack(vis_list, dim=0)  # [N, H, W, C]
+        all_accumulated_vis = torch.stack(accumulated_vis_list, dim=0)  # [N, H, W, C]
 
         print(f"[SAM3 Video] Output: {all_masks.shape[0]} masks, shape {all_masks.shape}")
         print(f"[SAM3 Video] Objects tracked: {num_objects}, plot_all_masks: {plot_all_masks}")
+        if previous_visualization is not None:
+            print(f"[SAM3 Video] Accumulated visualization on top of previous ({previous_visualization.shape[0]} frames)")
         print_vram("After extract")
 
         # Cache the result
-        result = (all_masks, all_frames, all_vis)
+        result = (all_masks, all_frames, all_vis, all_accumulated_vis)
         SAM3VideoOutput._cache[cache_key] = result
 
         return result

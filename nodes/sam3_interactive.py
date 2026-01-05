@@ -26,7 +26,8 @@ class SAM3PointCollector:
 
     Displays image canvas in the node where users can click to add:
     - Positive points (Left-click) - green circles
-    - Negative points (Shift+Left-click or Right-click) - red circles
+    - Negative points (Shift+click or Ctrl+click) - red circles
+    - Delete points (Alt+click on existing point)
 
     Outputs point arrays to feed into SAM3Segmentation node.
     """
@@ -38,7 +39,7 @@ class SAM3PointCollector:
         return {
             "required": {
                 "image": ("IMAGE", {
-                    "tooltip": "Image to display in interactive canvas. Left-click to add positive points (green), Shift+Left-click or Right-click to add negative points (red). Points are automatically normalized to image dimensions."
+                    "tooltip": "Image to display in interactive canvas. Left-click = positive points (green), Shift+click or Ctrl+click = negative points (red), Alt+click = delete point. Points are automatically normalized to image dimensions."
                 }),
                 "points_store": ("STRING", {"multiline": False, "default": "{}"}),
                 "coordinates": ("STRING", {"multiline": False, "default": "[]"}),
@@ -46,8 +47,8 @@ class SAM3PointCollector:
             },
         }
 
-    RETURN_TYPES = ("SAM3_POINTS_PROMPT", "SAM3_POINTS_PROMPT")
-    RETURN_NAMES = ("positive_points", "negative_points")
+    RETURN_TYPES = ("SAM3_POINTS_PROMPT", "SAM3_POINTS_PROMPT", "INT")
+    RETURN_NAMES = ("positive_points", "negative_points", "object_count")
     FUNCTION = "collect_points"
     CATEGORY = "SAM3"
     OUTPUT_NODE = True  # Makes node executable even without outputs connected
@@ -157,6 +158,7 @@ class SAM3PointCollector:
             # negative_points is empty dict (all negatives are in objects)
             positive_points = {"objects": multi_objects}
             negative_points = {"points": [], "labels": []}  # Empty - negatives are per-object
+            object_count = len(multi_objects)
 
         else:
             # LEGACY SINGLE-OBJECT MODE
@@ -192,9 +194,10 @@ class SAM3PointCollector:
                 print(f"[SAM3 Point Collector]   Negative point: ({n['x']:.1f}, {n['y']:.1f}) -> ({normalized_x:.3f}, {normalized_y:.3f})")
 
             print(f"[SAM3 Point Collector] Legacy output: {len(positive_points['points'])} positive, {len(negative_points['points'])} negative")
+            object_count = 1 if (pos_coords or neg_coords) else 0
 
         # Cache the result
-        result = (positive_points, negative_points)
+        result = (positive_points, negative_points, object_count)
         SAM3PointCollector._cache[cache_key] = result
 
         # Send image back to widget as base64

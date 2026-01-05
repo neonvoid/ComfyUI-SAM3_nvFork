@@ -2312,15 +2312,18 @@ class SAM3VideoTrim:
                     "default": "",
                     "tooltip": "Custom mask colors (comma-separated). Names: red, blue, green, yellow, magenta, cyan, orange, purple, pink, lime, teal, coral, gold, navy. Or hex: #FF0000. Order matches object IDs. Empty = default colors."
                 }),
+                "previous_visualization": ("IMAGE", {
+                    "tooltip": "Previous debug video to overlay new masks onto (for accumulating tracked players across runs)"
+                }),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "INT", "INT", "INT")
-    RETURN_NAMES = ("trimmed_frames", "masks", "visualization", "start_frame", "end_frame", "total_frames")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "IMAGE", "INT", "INT", "INT")
+    RETURN_NAMES = ("trimmed_frames", "masks", "visualization", "accumulated_visualization", "start_frame", "end_frame", "total_frames")
     FUNCTION = "trim_video"
     CATEGORY = "SAM3/video"
 
-    def trim_video(self, video_frames, masks, track_info, scores=None, obj_ids=None, viz_alpha=0.5, mask_colors=""):
+    def trim_video(self, video_frames, masks, track_info, scores=None, obj_ids=None, viz_alpha=0.5, mask_colors="", previous_visualization=None):
         """
         Trim video frames and extract masks/visualization for valid frame range.
 
@@ -2330,11 +2333,13 @@ class SAM3VideoTrim:
             track_info: JSON string with early exit metadata
             scores: Optional confidence scores dict
             viz_alpha: Transparency for mask overlay
+            previous_visualization: Optional previous debug video to overlay new masks onto
 
         Returns:
             trimmed_frames: Sliced video frames
             masks: Combined mask tensor [N, H, W]
             visualization: Colored overlay frames [N, H, W, C]
+            accumulated_visualization: Accumulated overlay (on previous_visualization if provided)
             start_frame: Start frame index
             end_frame: End frame index (inclusive)
             total_frames: Number of frames in output
@@ -2347,7 +2352,7 @@ class SAM3VideoTrim:
             print(f"[SAM3 VideoTrim] Returning original frames unchanged")
             h, w = video_frames.shape[1], video_frames.shape[2]
             empty_mask = torch.zeros(video_frames.shape[0], h, w)
-            return (video_frames, empty_mask, video_frames.clone(), 0, video_frames.shape[0] - 1, video_frames.shape[0])
+            return (video_frames, empty_mask, video_frames.clone(), video_frames.clone(), 0, video_frames.shape[0] - 1, video_frames.shape[0])
 
         # Extract frame range
         start_frame = info.get("start_frame", 0)
@@ -2389,11 +2394,18 @@ class SAM3VideoTrim:
         # Extract and process masks for valid frame range
         mask_list = []
         vis_list = []
+        accumulated_vis_list = []
 
         for out_idx, frame_idx in enumerate(range(start_frame, end_frame + 1)):
             # Get frame from trimmed video
             frame_tensor = trimmed[out_idx]
             vis_frame = frame_tensor.clone()
+
+            # Create accumulated visualization (overlay on previous or original)
+            if previous_visualization is not None and out_idx < previous_visualization.shape[0]:
+                accumulated_vis_frame = previous_visualization[out_idx].clone()
+            else:
+                accumulated_vis_frame = frame_tensor.clone()
 
             # Get mask for this frame
             if frame_idx in masks:
@@ -2445,6 +2457,7 @@ class SAM3VideoTrim:
                         # Add colored overlay to visualization
                         mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
                         vis_frame = vis_frame * (1 - viz_alpha * obj_mask.unsqueeze(-1)) + viz_alpha * mask_rgb
+                        accumulated_vis_frame = accumulated_vis_frame * (1 - viz_alpha * obj_mask.unsqueeze(-1)) + viz_alpha * mask_rgb
                 else:
                     # Single mask
                     if frame_mask.dim() == 3:
@@ -2463,20 +2476,25 @@ class SAM3VideoTrim:
                     # Add colored overlay
                     mask_rgb = combined_mask.unsqueeze(-1) * color.view(1, 1, 3)
                     vis_frame = vis_frame * (1 - viz_alpha * combined_mask.unsqueeze(-1)) + viz_alpha * mask_rgb
+                    accumulated_vis_frame = accumulated_vis_frame * (1 - viz_alpha * combined_mask.unsqueeze(-1)) + viz_alpha * mask_rgb
             else:
                 # No mask for this frame
                 combined_mask = torch.zeros(h, w)
 
             mask_list.append(combined_mask.cpu())
             vis_list.append(vis_frame.clamp(0, 1))
+            accumulated_vis_list.append(accumulated_vis_frame.clamp(0, 1))
 
         # Stack into batches
         all_masks = torch.stack(mask_list, dim=0)  # [N, H, W]
         all_vis = torch.stack(vis_list, dim=0)  # [N, H, W, C]
+        all_accumulated_vis = torch.stack(accumulated_vis_list, dim=0)  # [N, H, W, C]
 
         print(f"[SAM3 VideoTrim] Output: {total_frames} frames, masks shape {all_masks.shape}")
+        if previous_visualization is not None:
+            print(f"[SAM3 VideoTrim] Accumulated visualization on top of previous ({previous_visualization.shape[0]} frames)")
 
-        return (trimmed, all_masks, all_vis, start_frame, end_frame, total_frames)
+        return (trimmed, all_masks, all_vis, all_accumulated_vis, start_frame, end_frame, total_frames)
 
 
 # =============================================================================

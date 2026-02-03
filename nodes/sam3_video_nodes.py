@@ -566,12 +566,12 @@ class SAM3VideoSegmentation:
                 else:
                     print("[SAM3 Video] Warning: point mode selected but no points provided")
 
-        elif prompt_mode == "box":
-            # Box mode: add positive and/or negative boxes
-            has_boxes = False
+        # 3. Always process box inputs (can be combined with any mode)
+        # Boxes act as region hints/constraints in addition to text or point prompts
+        has_boxes = False
 
-            if positive_boxes and positive_boxes.get("boxes"):
-                box_data = positive_boxes["boxes"][0]  # First box
+        if positive_boxes and positive_boxes.get("boxes"):
+            for box_data in positive_boxes["boxes"]:
                 cx, cy, w, h = box_data
                 x1 = cx - w/2
                 y1 = cy - h/2
@@ -583,8 +583,8 @@ class SAM3VideoSegmentation:
                       f"box=[{x1:.3f}, {y1:.3f}, {x2:.3f}, {y2:.3f}]")
                 has_boxes = True
 
-            if negative_boxes and negative_boxes.get("boxes"):
-                box_data = negative_boxes["boxes"][0]  # First box
+        if negative_boxes and negative_boxes.get("boxes"):
+            for box_data in negative_boxes["boxes"]:
                 cx, cy, w, h = box_data
                 x1 = cx - w/2
                 y1 = cy - h/2
@@ -596,8 +596,8 @@ class SAM3VideoSegmentation:
                       f"box=[{x1:.3f}, {y1:.3f}, {x2:.3f}, {y2:.3f}]")
                 has_boxes = True
 
-            if not has_boxes:
-                print("[SAM3 Video] Warning: box mode selected but no boxes provided")
+        if prompt_mode == "box" and not has_boxes:
+            print("[SAM3 Video] Warning: box mode selected but no boxes provided")
 
         # Validate at least one prompt was added
         if len(video_state.prompts) == 0:

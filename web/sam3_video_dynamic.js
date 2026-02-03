@@ -297,26 +297,21 @@ app.registerExtension({
             }
 
             // Point mode inputs (these are input SLOTS, not widgets)
-            // Show first (in correct order), then hide others
+            // Box inputs are ALWAYS visible (can be used with any mode for region hints)
+            // Point inputs only visible in point mode
             if (mode === "point") {
                 // Ensure inputs are shown in correct order: positive first, then negative
                 showInput(node, "positive_points");
                 showInput(node, "negative_points");
-                hideInput(node, "positive_boxes");
-                hideInput(node, "negative_boxes");
-            } else if (mode === "box") {
-                hideInput(node, "positive_points");
-                hideInput(node, "negative_points");
-                // Ensure inputs are shown in correct order: positive first, then negative
-                showInput(node, "positive_boxes");
-                showInput(node, "negative_boxes");
             } else {
-                // Text mode - hide all point/box inputs
+                // Text or box mode - hide point inputs
                 hideInput(node, "positive_points");
                 hideInput(node, "negative_points");
-                hideInput(node, "positive_boxes");
-                hideInput(node, "negative_boxes");
             }
+
+            // Box inputs always visible - can be combined with text or used alone
+            showInput(node, "positive_boxes");
+            showInput(node, "negative_boxes");
 
             refreshNode(node);
         };

@@ -168,12 +168,9 @@ app.registerExtension({
                 // Store widget reference for updates
                 this.canvasWidget.domWidget = widget;
 
-                // Make widget dynamically sized - override computeSize
+                // Fixed widget height to avoid feedback loop with node sizing
                 widget.computeSize = (width) => {
-                    // Widget height = node height - title bar/padding (approx 80px)
-                    const nodeHeight = this.size ? this.size[1] : 540;
-                    const widgetHeight = Math.max(250, nodeHeight - 80);
-                    return [width, widgetHeight];
+                    return [width, 400];
                 };
 
                 // New Object button handler

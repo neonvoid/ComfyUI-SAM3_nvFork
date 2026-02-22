@@ -255,7 +255,8 @@ app.registerExtension({
                     hiddenWidgets.forEach((w, i) => w.type = originalTypes[i]);
 
                     // Update container height based on current node size
-                    const containerHeight = Math.max(250, this.size[1] - 80);
+                    // Offset accounts for header, output slots, and visible widgets (frame_index etc.)
+                    const containerHeight = Math.max(250, this.size[1] - 110);
                     if (container.style.height !== containerHeight + "px") {
                         container.style.height = containerHeight + "px";
                     }
@@ -376,7 +377,8 @@ app.registerExtension({
                         originalOnResize.apply(this, arguments);
                     }
                     // Update container to match widget size
-                    const containerHeight = Math.max(250, size[1] - 80);
+                    // Offset accounts for header, output slots, and visible widgets (frame_index etc.)
+                    const containerHeight = Math.max(250, size[1] - 110);
                     container.style.height = containerHeight + "px";
                     console.log(`[SAM3] Node resized to: ${size[0]}x${size[1]}, container height: ${containerHeight}px`);
                 };
@@ -388,7 +390,8 @@ app.registerExtension({
                         originalOnDrawForeground.apply(this, arguments);
                     }
                     // Update container height based on current node size
-                    const containerHeight = Math.max(250, this.size[1] - 80);
+                    // Offset accounts for header, output slots, and visible widgets (frame_index etc.)
+                    const containerHeight = Math.max(250, this.size[1] - 110);
                     if (container.style.height !== containerHeight + "px") {
                         container.style.height = containerHeight + "px";
                     }
@@ -401,10 +404,10 @@ app.registerExtension({
 
                 // Set initial node size
                 const nodeWidth = Math.max(450, this.size[0] || 450);
-                const nodeHeight = 540; // Initial height: canvas + controls
+                const nodeHeight = 570; // Initial height: canvas + controls + frame_index widget + outputs
                 this.setSize([nodeWidth, nodeHeight]);
 
-                // Set initial container height
+                // Set initial container height (nodeHeight - 110 offset)
                 container.style.height = "460px";
 
                 console.log("[SAM3] Node size set to:", [nodeWidth, nodeHeight]);

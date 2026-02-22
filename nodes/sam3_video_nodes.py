@@ -266,15 +266,13 @@ class SAM3VideoSegmentation:
     Select prompt_mode to choose between:
     - text: Track objects by text description (comma-separated for multiple)
     - point: Track objects by clicking points (positive/negative)
-    - box: Track objects by drawing boxes (positive/negative)
 
-    Note: SAM3 video does NOT support combining different prompt types.
-    Each mode is mutually exclusive.
+    Box inputs (positive/negative) can be combined with either mode as region hints.
     """
     # Class-level cache for video state results
     _cache = {}
 
-    PROMPT_MODES = ["text", "point", "box"]
+    PROMPT_MODES = ["text", "point"]
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -285,7 +283,7 @@ class SAM3VideoSegmentation:
                 }),
                 "prompt_mode": (cls.PROMPT_MODES, {
                     "default": "text",
-                    "tooltip": "Prompt type: text (describe objects), point (click on objects), or box (draw rectangles)"
+                    "tooltip": "Prompt type: text (describe objects) or point (click on objects). Box inputs can be combined with either mode."
                 }),
             },
             "optional": {
@@ -379,9 +377,12 @@ class SAM3VideoSegmentation:
                    offload_video_to_cpu=True, offload_state_to_cpu=False,
                    hotstart_delay=15, hotstart_unmatch_thresh=8, hotstart_dup_thresh=8,
                    new_det_thresh=0.4, assoc_iou_thresh=0.1):
-        # Use a stable hash based on video content
-        # Don't use float(mean()) - it has floating point precision issues on GPU
         import hashlib
+
+        # Guard: IS_CHANGED is called during cache checking before upstream
+        # nodes execute, so video_frames may be None
+        if video_frames is None:
+            return float("NaN")
 
         # Create a stable hash from video frame content
         # Use shape + corner pixels from first and last frame (deterministic bytes, no float issues)
@@ -398,7 +399,7 @@ class SAM3VideoSegmentation:
 
         video_hash = h.hexdigest()
 
-        result = hash((
+        return hash((
             video_hash,
             prompt_mode,
             text_prompt,
@@ -416,11 +417,6 @@ class SAM3VideoSegmentation:
             new_det_thresh,
             assoc_iou_thresh,
         ))
-        print(f"[IS_CHANGED DEBUG] SAM3VideoSegmentation: video_hash={video_hash}, prompt_mode={prompt_mode}")
-        print(f"[IS_CHANGED DEBUG] SAM3VideoSegmentation: positive_points={positive_points}")
-        print(f"[IS_CHANGED DEBUG] SAM3VideoSegmentation: negative_points={negative_points}")
-        print(f"[IS_CHANGED DEBUG] SAM3VideoSegmentation: returning hash={result}")
-        return result
 
     RETURN_TYPES = ("SAM3_VIDEO_STATE",)
     RETURN_NAMES = ("video_state",)
@@ -596,9 +592,6 @@ class SAM3VideoSegmentation:
                       f"box=[{x1:.3f}, {y1:.3f}, {x2:.3f}, {y2:.3f}]")
                 has_boxes = True
 
-        if prompt_mode == "box" and not has_boxes:
-            print("[SAM3 Video] Warning: box mode selected but no boxes provided")
-
         # Validate at least one prompt was added
         if len(video_state.prompts) == 0:
             print(f"[SAM3 Video] Warning: No prompts added for mode '{prompt_mode}'")
@@ -654,6 +647,9 @@ class SAM3AddPrompt:
                 "positive_boxes": ("SAM3_BOXES_PROMPT", {
                     "tooltip": "Positive boxes - draw around objects to reinforce"
                 }),
+                "negative_boxes": ("SAM3_BOXES_PROMPT", {
+                    "tooltip": "Negative boxes - draw around areas to exclude from tracking"
+                }),
                 "obj_id": ("INT", {
                     "default": -1,
                     "min": -1,
@@ -668,7 +664,7 @@ class SAM3AddPrompt:
     CATEGORY = "SAM3/video"
 
     def add_prompt(self, video_state, frame_idx, positive_points=None, negative_points=None,
-                   positive_boxes=None, obj_id=-1):
+                   positive_boxes=None, negative_boxes=None, obj_id=-1):
         """
         Add prompts on an additional frame to reinforce tracking.
 
@@ -678,6 +674,7 @@ class SAM3AddPrompt:
             positive_points: Points to add (from points editor)
             negative_points: Negative points to exclude
             positive_boxes: Boxes to add
+            negative_boxes: Boxes for areas to exclude
             obj_id: Object ID to reinforce (-1 = auto-assign)
 
         Returns:
@@ -757,9 +754,17 @@ class SAM3AddPrompt:
                 box_coords = [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
                 prompt = VideoPrompt.create_box(frame_idx, obj_id, box_coords, is_positive=True)
                 video_state = video_state.with_prompt(prompt)
-                print(f"[SAM3 AddPrompt] Added box prompt: frame={frame_idx}, obj={obj_id}")
+                print(f"[SAM3 AddPrompt] Added positive box: frame={frame_idx}, obj={obj_id}")
                 prompts_added += 1
                 obj_id += 1
+
+        if negative_boxes and negative_boxes.get("boxes"):
+            for box in negative_boxes["boxes"]:
+                box_coords = [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
+                prompt = VideoPrompt.create_box(frame_idx, obj_id, box_coords, is_positive=False)
+                video_state = video_state.with_prompt(prompt)
+                print(f"[SAM3 AddPrompt] Added negative box: frame={frame_idx}, obj={obj_id}")
+                prompts_added += 1
 
         print(f"[SAM3 AddPrompt] Total prompts added: {prompts_added}")
         print(f"[SAM3 AddPrompt] New total prompts: {len(video_state.prompts)}")
@@ -876,10 +881,9 @@ class SAM3Propagate:
         # Use object identity for caching - if upstream node is cached,
         # it returns the same object, so id() will match
         # This is more reliable than hashing content since video_state is immutable
-        result = (id(video_state), start_frame, end_frame, backward_stop_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
-        print(f"[IS_CHANGED DEBUG] SAM3Propagate: video_state id={id(video_state)}, session={video_state.session_uuid if video_state else None}")
-        print(f"[IS_CHANGED DEBUG] SAM3Propagate: returning {result}")
-        return result
+        if video_state is None:
+            return float("NaN")
+        return (id(video_state), start_frame, end_frame, backward_stop_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
 
     def _plan_chunks(self, total_frames: int, chunk_size: int, start_frame: int = 0):
         """
@@ -1972,9 +1976,8 @@ class SAM3VideoOutput:
 
     @classmethod
     def IS_CHANGED(cls, masks, video_state, scores=None, obj_ids=None, obj_id=-1, plot_all_masks=True, draw_legend=True, mask_colors="", previous_visualization=None):
-        # Always re-run this node when params change, but this is cheap
-        # The key is that changing these here does NOT invalidate upstream cache
-        # ComfyUI caches based on input values - masks/video_state don't change
+        if masks is None or video_state is None:
+            return float("NaN")
         return (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend, mask_colors, id(previous_visualization))
 
     RETURN_TYPES = ("MASK", "IMAGE", "IMAGE", "IMAGE")

@@ -30,6 +30,9 @@ class SAM3PointCollector:
     - Delete points (Alt+click on existing point)
 
     Outputs point arrays to feed into SAM3Segmentation node.
+
+    Accepts video batches — use frame_index to select which frame to annotate.
+    Outputs frame_index for direct connection to SAM3VideoSegmentation's frame_idx.
     """
     # Class-level cache for output results
     _cache = {}
@@ -39,22 +42,30 @@ class SAM3PointCollector:
         return {
             "required": {
                 "image": ("IMAGE", {
-                    "tooltip": "Image to display in interactive canvas. Left-click = positive points (green), Shift+click or Ctrl+click = negative points (red), Alt+click = delete point. Points are automatically normalized to image dimensions."
+                    "tooltip": "Image or video batch to display in interactive canvas. Left-click = positive points (green), Shift+click or Ctrl+click = negative points (red), Alt+click = delete point. Points are automatically normalized to image dimensions."
                 }),
                 "points_store": ("STRING", {"multiline": False, "default": "{}"}),
                 "coordinates": ("STRING", {"multiline": False, "default": "[]"}),
                 "neg_coordinates": ("STRING", {"multiline": False, "default": "[]"}),
             },
+            "optional": {
+                "frame_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 99999,
+                    "tooltip": "Frame index to display from video batch (0 = first frame). Output connects directly to SAM3VideoSegmentation's frame_idx."
+                }),
+            },
         }
 
-    RETURN_TYPES = ("SAM3_POINTS_PROMPT", "SAM3_POINTS_PROMPT", "INT")
-    RETURN_NAMES = ("positive_points", "negative_points", "object_count")
+    RETURN_TYPES = ("SAM3_POINTS_PROMPT", "SAM3_POINTS_PROMPT", "INT", "INT", "INT")
+    RETURN_NAMES = ("positive_points", "negative_points", "object_count", "frame_index", "total_frames")
     FUNCTION = "collect_points"
     CATEGORY = "SAM3"
     OUTPUT_NODE = True  # Makes node executable even without outputs connected
 
     @classmethod
-    def IS_CHANGED(cls, image, points_store, coordinates, neg_coordinates):
+    def IS_CHANGED(cls, image, points_store, coordinates, neg_coordinates, frame_index=0):
         # Return hash based on actual point content, not object identity
         # This ensures downstream nodes don't re-run when points haven't changed
         import hashlib
@@ -62,12 +73,13 @@ class SAM3PointCollector:
         h.update(str(image.shape).encode())
         h.update(coordinates.encode())
         h.update(neg_coordinates.encode())
+        h.update(str(frame_index).encode())
         result = h.hexdigest()
-        print(f"[IS_CHANGED DEBUG] SAM3PointCollector: shape={image.shape}, coords={coordinates}, neg_coords={neg_coordinates}")
+        print(f"[IS_CHANGED DEBUG] SAM3PointCollector: shape={image.shape}, coords={coordinates}, neg_coords={neg_coordinates}, frame={frame_index}")
         print(f"[IS_CHANGED DEBUG] SAM3PointCollector: returning hash={result}")
         return result
 
-    def collect_points(self, image, points_store, coordinates, neg_coordinates):
+    def collect_points(self, image, points_store, coordinates, neg_coordinates, frame_index=0):
         """
         Collect points from interactive canvas
 
@@ -78,11 +90,14 @@ class SAM3PointCollector:
             points_store: Combined JSON storage (hidden widget) - may contain 'objects' key for multi-object
             coordinates: Positive points JSON (hidden widget) - legacy format
             neg_coordinates: Negative points JSON (hidden widget) - legacy format
+            frame_index: Frame index to display from video batch (0 = first frame)
 
         Returns:
-            Tuple of (positive_points, negative_points) as separate SAM3_POINTS_PROMPT outputs
-            For multi-object mode, positive_points will contain an 'objects' key with per-object data
+            Tuple of (positive_points, negative_points, object_count, frame_index, total_frames)
         """
+        total_frames = image.shape[0]
+        frame_index = min(frame_index, total_frames - 1)
+
         # Create cache key from inputs
         import hashlib
         h = hashlib.md5()
@@ -90,6 +105,7 @@ class SAM3PointCollector:
         h.update(points_store.encode())
         h.update(coordinates.encode())
         h.update(neg_coordinates.encode())
+        h.update(str(frame_index).encode())
         cache_key = h.hexdigest()
 
         # Check if we have cached result
@@ -97,13 +113,14 @@ class SAM3PointCollector:
             cached = SAM3PointCollector._cache[cache_key]
             print(f"[SAM3 Point Collector] CACHE HIT - returning cached result for key={cache_key[:8]}")
             # Still need to return UI update
-            img_base64 = self.tensor_to_base64(image)
+            img_base64 = self.tensor_to_base64(image, frame_index)
             return {
-                "ui": {"bg_image": [img_base64]},
+                "ui": {"bg_image": [img_base64], "total_frames": [total_frames]},
                 "result": cached  # Return the SAME objects
             }
 
         print(f"[SAM3 Point Collector] CACHE MISS - computing new result for key={cache_key[:8]}")
+        print(f"[SAM3 Point Collector] Displaying frame {frame_index}/{total_frames}")
 
         # Get image dimensions for normalization
         img_height, img_width = image.shape[1], image.shape[2]
@@ -197,22 +214,23 @@ class SAM3PointCollector:
             object_count = 1 if (pos_coords or neg_coords) else 0
 
         # Cache the result
-        result = (positive_points, negative_points, object_count)
+        result = (positive_points, negative_points, object_count, frame_index, total_frames)
         SAM3PointCollector._cache[cache_key] = result
 
         # Send image back to widget as base64
-        img_base64 = self.tensor_to_base64(image)
+        img_base64 = self.tensor_to_base64(image, frame_index)
 
         return {
-            "ui": {"bg_image": [img_base64]},
+            "ui": {"bg_image": [img_base64], "total_frames": [total_frames]},
             "result": result
         }
 
-    def tensor_to_base64(self, tensor):
+    def tensor_to_base64(self, tensor, frame_index=0):
         """Convert ComfyUI image tensor to base64 string for JavaScript widget"""
         # Convert from [B, H, W, C] to PIL Image
-        # Take first image if batch
-        img_array = tensor[0].cpu().numpy()
+        # Select the requested frame (clamped to valid range)
+        frame_index = min(frame_index, tensor.shape[0] - 1)
+        img_array = tensor[frame_index].cpu().numpy()
         # Convert from 0-1 float to 0-255 uint8
         img_array = (img_array * 255).astype(np.uint8)
         pil_img = Image.fromarray(img_array)
@@ -235,6 +253,9 @@ class SAM3BBoxCollector:
     - Negative bounding boxes (Shift+Left-click and drag or Right-click and drag) - red rectangles
 
     Outputs bbox arrays to feed into SAM3Segmentation node.
+
+    Accepts video batches — use frame_index to select which frame to annotate.
+    Outputs frame_index for direct connection to SAM3VideoSegmentation's frame_idx.
     """
     # Class-level cache for output results
     _cache = {}
@@ -244,21 +265,29 @@ class SAM3BBoxCollector:
         return {
             "required": {
                 "image": ("IMAGE", {
-                    "tooltip": "Image to display in interactive canvas. Click and drag to draw positive bboxes (cyan), Shift+Click/Right-click and drag to draw negative bboxes (red). Bounding boxes are automatically normalized to image dimensions."
+                    "tooltip": "Image or video batch to display in interactive canvas. Click and drag to draw positive bboxes (cyan), Shift+Click/Right-click and drag to draw negative bboxes (red). Bounding boxes are automatically normalized to image dimensions."
                 }),
                 "bboxes": ("STRING", {"multiline": False, "default": "[]"}),
                 "neg_bboxes": ("STRING", {"multiline": False, "default": "[]"}),
             },
+            "optional": {
+                "frame_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 99999,
+                    "tooltip": "Frame index to display from video batch (0 = first frame). Output connects directly to SAM3VideoSegmentation's frame_idx."
+                }),
+            },
         }
 
-    RETURN_TYPES = ("SAM3_BOXES_PROMPT", "SAM3_BOXES_PROMPT")
-    RETURN_NAMES = ("positive_bboxes", "negative_bboxes")
+    RETURN_TYPES = ("SAM3_BOXES_PROMPT", "SAM3_BOXES_PROMPT", "INT", "INT")
+    RETURN_NAMES = ("positive_bboxes", "negative_bboxes", "frame_index", "total_frames")
     FUNCTION = "collect_bboxes"
     CATEGORY = "SAM3"
     OUTPUT_NODE = True  # Makes node executable even without outputs connected
 
     @classmethod
-    def IS_CHANGED(cls, image, bboxes, neg_bboxes):
+    def IS_CHANGED(cls, image, bboxes, neg_bboxes, frame_index=0):
         # Return hash based on actual bbox content, not object identity
         # This ensures downstream nodes don't re-run when bboxes haven't changed
         import hashlib
@@ -266,12 +295,13 @@ class SAM3BBoxCollector:
         h.update(str(image.shape).encode())
         h.update(bboxes.encode())
         h.update(neg_bboxes.encode())
+        h.update(str(frame_index).encode())
         result = h.hexdigest()
-        print(f"[IS_CHANGED DEBUG] SAM3BBoxCollector: shape={image.shape}, bboxes={bboxes}, neg_bboxes={neg_bboxes}")
+        print(f"[IS_CHANGED DEBUG] SAM3BBoxCollector: shape={image.shape}, bboxes={bboxes}, neg_bboxes={neg_bboxes}, frame={frame_index}")
         print(f"[IS_CHANGED DEBUG] SAM3BBoxCollector: returning hash={result}")
         return result
 
-    def collect_bboxes(self, image, bboxes, neg_bboxes):
+    def collect_bboxes(self, image, bboxes, neg_bboxes, frame_index=0):
         """
         Collect bounding boxes from interactive canvas
 
@@ -279,16 +309,21 @@ class SAM3BBoxCollector:
             image: ComfyUI image tensor [B, H, W, C]
             bboxes: Positive BBoxes JSON array (hidden widget)
             neg_bboxes: Negative BBoxes JSON array (hidden widget)
+            frame_index: Frame index to display from video batch (0 = first frame)
 
         Returns:
-            Tuple of (positive_bboxes, negative_bboxes) as separate SAM3_BOXES_PROMPT outputs
+            Tuple of (positive_bboxes, negative_bboxes, frame_index, total_frames)
         """
+        total_frames = image.shape[0]
+        frame_index = min(frame_index, total_frames - 1)
+
         # Create cache key from inputs
         import hashlib
         h = hashlib.md5()
         h.update(str(image.shape).encode())
         h.update(bboxes.encode())
         h.update(neg_bboxes.encode())
+        h.update(str(frame_index).encode())
         cache_key = h.hexdigest()
 
         # Check if we have cached result
@@ -296,13 +331,14 @@ class SAM3BBoxCollector:
             cached = SAM3BBoxCollector._cache[cache_key]
             print(f"[SAM3 BBox Collector] CACHE HIT - returning cached result for key={cache_key[:8]}")
             # Still need to return UI update
-            img_base64 = self.tensor_to_base64(image)
+            img_base64 = self.tensor_to_base64(image, frame_index)
             return {
-                "ui": {"bg_image": [img_base64]},
+                "ui": {"bg_image": [img_base64], "total_frames": [total_frames]},
                 "result": cached  # Return the SAME objects
             }
 
         print(f"[SAM3 BBox Collector] CACHE MISS - computing new result for key={cache_key[:8]}")
+        print(f"[SAM3 BBox Collector] Displaying frame {frame_index}/{total_frames}")
 
         # Parse bboxes from JSON
         try:
@@ -375,22 +411,23 @@ class SAM3BBoxCollector:
         }
 
         # Cache the result
-        result = (positive_prompt, negative_prompt)
+        result = (positive_prompt, negative_prompt, frame_index, total_frames)
         SAM3BBoxCollector._cache[cache_key] = result
 
         # Send image back to widget as base64
-        img_base64 = self.tensor_to_base64(image)
+        img_base64 = self.tensor_to_base64(image, frame_index)
 
         return {
-            "ui": {"bg_image": [img_base64]},
+            "ui": {"bg_image": [img_base64], "total_frames": [total_frames]},
             "result": result
         }
 
-    def tensor_to_base64(self, tensor):
+    def tensor_to_base64(self, tensor, frame_index=0):
         """Convert ComfyUI image tensor to base64 string for JavaScript widget"""
         # Convert from [B, H, W, C] to PIL Image
-        # Take first image if batch
-        img_array = tensor[0].cpu().numpy()
+        # Select the requested frame (clamped to valid range)
+        frame_index = min(frame_index, tensor.shape[0] - 1)
+        img_array = tensor[frame_index].cpu().numpy()
         # Convert from 0-1 float to 0-255 uint8
         img_array = (img_array * 255).astype(np.uint8)
         pil_img = Image.fromarray(img_array)

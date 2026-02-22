@@ -1,0 +1,1230 @@
+{
+  "id": "60f74668-af06-4961-bd76-cb4589d687d2",
+  "revision": 0,
+  "last_node_id": 22,
+  "last_link_id": 37,
+  "nodes": [
+    {
+      "id": 15,
+      "type": "PreviewAnimation",
+      "pos": [
+        5869.527559399664,
+        -1085.214370454094
+      ],
+      "size": [
+        270,
+        78
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 24
+        },
+        {
+          "name": "masks",
+          "shape": 7,
+          "type": "MASK",
+          "link": null
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": 23
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfyui-kjnodes",
+        "ver": "c661baadd9683c0033cd2a6ad90157c6d099a6c2",
+        "Node name for S&R": "PreviewAnimation"
+      },
+      "widgets_values": [
+        0.01
+      ]
+    },
+    {
+      "id": 8,
+      "type": "NV_SAM3SelectMask",
+      "pos": [
+        5321.154527295649,
+        -1525.459271236967
+      ],
+      "size": [
+        271.8333282470703,
+        170
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "all_masks",
+          "type": "MASK",
+          "link": 18
+        },
+        {
+          "name": "video_frames",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "selected_masks",
+          "type": "MASK",
+          "links": [
+            21
+          ]
+        },
+        {
+          "name": "selected_ids",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "visualization",
+          "type": "IMAGE",
+          "links": [
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/ComfyUI-SAM3_nvFork",
+        "ver": "f39906d1f98da3040acf9163587ed238d0488f16",
+        "Node name for S&R": "NV_SAM3SelectMask"
+      },
+      "widgets_values": [
+        "all",
+        "union",
+        0.5,
+        "cyan"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "VHS_VideoInfoLoaded",
+      "pos": [
+        1384.0757055501829,
+        -1074.8545924147702
+      ],
+      "size": [
+        250.4166717529297,
+        106
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video_info",
+          "type": "VHS_VIDEOINFO",
+          "link": 19
+        }
+      ],
+      "outputs": [
+        {
+          "name": "fps🟦",
+          "type": "FLOAT",
+          "links": [
+            20,
+            23
+          ]
+        },
+        {
+          "name": "frame_count🟦",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "duration🟦",
+          "type": "FLOAT",
+          "links": null
+        },
+        {
+          "name": "width🟦",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "height🟦",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-videohelpersuite",
+        "ver": "1.7.7",
+        "Node name for S&R": "VHS_VideoInfoLoaded"
+      },
+      "widgets_values": {}
+    },
+    {
+      "id": 1,
+      "type": "VHS_LoadVideo",
+      "pos": [
+        1380.067972521288,
+        -1586.3105693869595
+      ],
+      "size": [
+        255.81666564941406,
+        456.45872283286235
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "meta_batch",
+          "shape": 7,
+          "type": "VHS_BatchManager",
+          "link": null
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2,
+            5,
+            22,
+            25
+          ]
+        },
+        {
+          "name": "frame_count",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        },
+        {
+          "name": "video_info",
+          "type": "VHS_VIDEOINFO",
+          "links": [
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-videohelpersuite",
+        "ver": "1.7.7",
+        "Node name for S&R": "VHS_LoadVideo"
+      },
+      "widgets_values": {
+        "video": "winky.mkv",
+        "force_rate": 0,
+        "custom_width": 0,
+        "custom_height": 0,
+        "frame_load_cap": 0,
+        "skip_first_frames": 0,
+        "select_every_nth": 1,
+        "format": "None",
+        "videopreview": {
+          "hidden": false,
+          "paused": false,
+          "params": {
+            "filename": "winky.mkv",
+            "type": "input",
+            "format": "video/mkv",
+            "force_rate": 0,
+            "custom_width": 0,
+            "custom_height": 0,
+            "frame_load_cap": 0,
+            "skip_first_frames": 0,
+            "select_every_nth": 1
+          }
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "MarkdownNote",
+      "pos": [
+        1910.0776559707172,
+        -1091.3996876886356
+      ],
+      "size": [
+        312.96642991719045,
+        257.6759199053604
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "# We have the ability to track/prompt sam3 in 3 ways\n\n# Text\n# Points\n# Bounding areas"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 21,
+      "type": "MarkdownNote",
+      "pos": [
+        1903.9583854760401,
+        -771.3536903394673
+      ],
+      "size": [
+        312.96642991719045,
+        257.6759199053604
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "# currently this nodesets back-end supports the following prompt combos\n\n## text only\n## points only\n## boxes only\n## text + boxes \n## points + boxes "
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 16,
+      "type": "MarkdownNote",
+      "pos": [
+        3042.3151134891914,
+        -1136.7375997573176
+      ],
+      "size": [
+        546.0163618539736,
+        340.3424207318442
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "# Settings explained:\n## hotstart_delay: 15 (frames before new objects confirmed)\n### example: Objects take too long to appear | Lower `hotstart_delay` (e.g., 5-8) |\n\n\n## hotstart_unmatch_thresh: 8 (missed frames before track removed)\n### example: Objects flash on/off | Increase `hotstart_unmatch_thresh` (e.g., 10-15) |\n\n## hotstart_dup_thresh: 8 (overlap frames before duplicate removed)\n### Low-confidence objects not tracked | Lower `new_det_thresh` (e.g., 0.3) |\n\n\n## new_det_thresh: 0.4 (confidence for new tracks)\n### Duplicate tracks on same object | Lower `assoc_iou_thresh` (e.g., 0.05) |\n\n\n## assoc_iou_thresh: 0.1 (IoU for detection-track association)\n### Objects removed during occlusion | Increase `hotstart_unmatch_thresh` |"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 12,
+      "type": "SAM3VideoSegmentation",
+      "pos": [
+        3169.473981234423,
+        -1542.9416510498522
+      ],
+      "size": [
+        303.71665954589844,
+        354
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video_frames",
+          "type": "IMAGE",
+          "link": 5
+        },
+        {
+          "name": "positive_points",
+          "shape": 7,
+          "type": "SAM3_POINTS_PROMPT",
+          "link": 32
+        },
+        {
+          "name": "negative_points",
+          "shape": 7,
+          "type": "SAM3_POINTS_PROMPT",
+          "link": 33
+        },
+        {
+          "name": "positive_boxes",
+          "shape": 7,
+          "type": "SAM3_BOXES_PROMPT",
+          "link": 34
+        },
+        {
+          "name": "negative_boxes",
+          "shape": 7,
+          "type": "SAM3_BOXES_PROMPT",
+          "link": 35
+        },
+        {
+          "name": "frame_idx",
+          "shape": 7,
+          "type": "INT",
+          "widget": {
+            "name": "frame_idx"
+          },
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_state",
+          "type": "SAM3_VIDEO_STATE",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/ComfyUI-SAM3_nvFork",
+        "ver": "57c57db6ca7bee9ffa973b7145e86fecdc5db244",
+        "Node name for S&R": "SAM3VideoSegmentation"
+      },
+      "widgets_values": [
+        "point",
+        0.75,
+        true,
+        false,
+        15,
+        8,
+        8,
+        0.4,
+        0.1,
+        0.1
+      ]
+    },
+    {
+      "id": 11,
+      "type": "SAM3PointCollector",
+      "pos": [
+        2349.904162390592,
+        -1236.5932640092801
+      ],
+      "size": [
+        543.301476041946,
+        611.5311316321589
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive_points",
+          "type": "SAM3_POINTS_PROMPT",
+          "links": [
+            32
+          ]
+        },
+        {
+          "name": "negative_points",
+          "type": "SAM3_POINTS_PROMPT",
+          "links": [
+            33
+          ]
+        },
+        {
+          "name": "object_count",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "frame_index",
+          "type": "INT",
+          "links": [
+            10
+          ]
+        },
+        {
+          "name": "total_frames",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/ComfyUI-SAM3_nvFork",
+        "ver": "57c57db6ca7bee9ffa973b7145e86fecdc5db244",
+        "Node name for S&R": "SAM3PointCollector"
+      },
+      "widgets_values": [
+        "{\"objects\":[{\"obj_id\":1,\"positive_points\":[[211.21450101160247,187.18041169450356],[287.77103376137194,211.64671780031384],[223.05314009661834,281.0994577135817],[122.03008657114938,230.588374140296],[185.95873763023522,127.19849995122674],[318.55149538241324,172.18493375868437],[313.0267971427392,294.51646428773574],[139.39342389583936,350.55219762684965],[277.5108798876915,382.1216248601532],[316.9730101710778,355.28761171184516]],\"negative_points\":[[413.2606080625404,379.7539178176554],[410.10363763986953,216.38213188530938],[526.911543278693,215.5928962044768],[571.1091291960857,131.9339140362223],[395.1080281321827,74.31970933544322],[239.62723481564063,53.799581633795896],[41.527340793041276,80.63359478210394],[40.73809818737355,418.42646617845236]]}],\"positive\":[{\"x\":211.21450101160247,\"y\":187.18041169450356},{\"x\":287.77103376137194,\"y\":211.64671780031384},{\"x\":223.05314009661834,\"y\":281.0994577135817},{\"x\":122.03008657114938,\"y\":230.588374140296},{\"x\":185.95873763023522,\"y\":127.19849995122674},{\"x\":318.55149538241324,\"y\":172.18493375868437},{\"x\":313.0267971427392,\"y\":294.51646428773574},{\"x\":139.39342389583936,\"y\":350.55219762684965},{\"x\":277.5108798876915,\"y\":382.1216248601532},{\"x\":316.9730101710778,\"y\":355.28761171184516}],\"negative\":[{\"x\":413.2606080625404,\"y\":379.7539178176554},{\"x\":410.10363763986953,\"y\":216.38213188530938},{\"x\":526.911543278693,\"y\":215.5928962044768},{\"x\":571.1091291960857,\"y\":131.9339140362223},{\"x\":395.1080281321827,\"y\":74.31970933544322},{\"x\":239.62723481564063,\"y\":53.799581633795896},{\"x\":41.527340793041276,\"y\":80.63359478210394},{\"x\":40.73809818737355,\"y\":418.42646617845236}]}",
+        "[{\"x\":211.21450101160247,\"y\":187.18041169450356},{\"x\":287.77103376137194,\"y\":211.64671780031384},{\"x\":223.05314009661834,\"y\":281.0994577135817},{\"x\":122.03008657114938,\"y\":230.588374140296},{\"x\":185.95873763023522,\"y\":127.19849995122674},{\"x\":318.55149538241324,\"y\":172.18493375868437},{\"x\":313.0267971427392,\"y\":294.51646428773574},{\"x\":139.39342389583936,\"y\":350.55219762684965},{\"x\":277.5108798876915,\"y\":382.1216248601532},{\"x\":316.9730101710778,\"y\":355.28761171184516}]",
+        "[{\"x\":413.2606080625404,\"y\":379.7539178176554},{\"x\":410.10363763986953,\"y\":216.38213188530938},{\"x\":526.911543278693,\"y\":215.5928962044768},{\"x\":571.1091291960857,\"y\":131.9339140362223},{\"x\":395.1080281321827,\"y\":74.31970933544322},{\"x\":239.62723481564063,\"y\":53.799581633795896},{\"x\":41.527340793041276,\"y\":80.63359478210394},{\"x\":40.73809818737355,\"y\":418.42646617845236}]",
+        0,
+        ""
+      ]
+    },
+    {
+      "id": 18,
+      "type": "NV_BBoxCreator",
+      "pos": [
+        2344.7322908180404,
+        -471.5751820749544
+      ],
+      "size": [
+        557.6465461245252,
+        630
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 25
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "positive_boxes",
+          "type": "SAM3_BOXES_PROMPT",
+          "links": [
+            26,
+            34
+          ]
+        },
+        {
+          "name": "negative_boxes",
+          "type": "SAM3_BOXES_PROMPT",
+          "links": [
+            35
+          ]
+        },
+        {
+          "name": "aspect_ratio",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "ratio_value",
+          "type": "FLOAT",
+          "links": null
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/NV_Comfy_Utils",
+        "ver": "ccad9ff81f914ad920fd453f5d483053e8fbd5da",
+        "Node name for S&R": "NV_BBoxCreator"
+      },
+      "widgets_values": [
+        "Free",
+        "16:9",
+        "{\"positive\":[{\"x1\":46,\"y1\":37,\"x2\":435,\"y2\":430}],\"negative\":[]}",
+        ""
+      ],
+      "bboxCreatorState": {
+        "positive": [
+          {
+            "x1": 46,
+            "y1": 37,
+            "x2": 435,
+            "y2": 430
+          }
+        ],
+        "negative": []
+      }
+    },
+    {
+      "id": 19,
+      "type": "SAM3PointCollector",
+      "pos": [
+        2774.10734395694,
+        -2599.6055265506766
+      ],
+      "size": [
+        543.301476041946,
+        611.5311316321589
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive_points",
+          "type": "SAM3_POINTS_PROMPT",
+          "links": [
+            30
+          ]
+        },
+        {
+          "name": "negative_points",
+          "type": "SAM3_POINTS_PROMPT",
+          "links": [
+            31
+          ]
+        },
+        {
+          "name": "object_count",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "frame_index",
+          "type": "INT",
+          "links": [
+            36
+          ]
+        },
+        {
+          "name": "total_frames",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/ComfyUI-SAM3_nvFork",
+        "ver": "57c57db6ca7bee9ffa973b7145e86fecdc5db244",
+        "Node name for S&R": "SAM3PointCollector"
+      },
+      "widgets_values": [
+        "{\"objects\":[{\"obj_id\":1,\"positive_points\":[[211.21450101160247,187.18041169450356],[287.77103376137194,211.64671780031384],[223.05314009661834,281.0994577135817],[122.03008657114938,230.588374140296],[185.95873763023522,127.19849995122674],[318.55149538241324,172.18493375868437],[313.0267971427392,294.51646428773574],[139.39342389583936,350.55219762684965],[277.5108798876915,382.1216248601532],[316.9730101710778,355.28761171184516]],\"negative_points\":[[413.2606080625404,379.7539178176554],[410.10363763986953,216.38213188530938],[526.911543278693,215.5928962044768],[571.1091291960857,131.9339140362223],[395.1080281321827,74.31970933544322],[239.62723481564063,53.799581633795896],[41.527340793041276,80.63359478210394],[40.73809818737355,418.42646617845236]]}],\"positive\":[{\"x\":211.21450101160247,\"y\":187.18041169450356},{\"x\":287.77103376137194,\"y\":211.64671780031384},{\"x\":223.05314009661834,\"y\":281.0994577135817},{\"x\":122.03008657114938,\"y\":230.588374140296},{\"x\":185.95873763023522,\"y\":127.19849995122674},{\"x\":318.55149538241324,\"y\":172.18493375868437},{\"x\":313.0267971427392,\"y\":294.51646428773574},{\"x\":139.39342389583936,\"y\":350.55219762684965},{\"x\":277.5108798876915,\"y\":382.1216248601532},{\"x\":316.9730101710778,\"y\":355.28761171184516}],\"negative\":[{\"x\":413.2606080625404,\"y\":379.7539178176554},{\"x\":410.10363763986953,\"y\":216.38213188530938},{\"x\":526.911543278693,\"y\":215.5928962044768},{\"x\":571.1091291960857,\"y\":131.9339140362223},{\"x\":395.1080281321827,\"y\":74.31970933544322},{\"x\":239.62723481564063,\"y\":53.799581633795896},{\"x\":41.527340793041276,\"y\":80.63359478210394},{\"x\":40.73809818737355,\"y\":418.42646617845236}]}",
+        "[{\"x\":211.21450101160247,\"y\":187.18041169450356},{\"x\":287.77103376137194,\"y\":211.64671780031384},{\"x\":223.05314009661834,\"y\":281.0994577135817},{\"x\":122.03008657114938,\"y\":230.588374140296},{\"x\":185.95873763023522,\"y\":127.19849995122674},{\"x\":318.55149538241324,\"y\":172.18493375868437},{\"x\":313.0267971427392,\"y\":294.51646428773574},{\"x\":139.39342389583936,\"y\":350.55219762684965},{\"x\":277.5108798876915,\"y\":382.1216248601532},{\"x\":316.9730101710778,\"y\":355.28761171184516}]",
+        "[{\"x\":413.2606080625404,\"y\":379.7539178176554},{\"x\":410.10363763986953,\"y\":216.38213188530938},{\"x\":526.911543278693,\"y\":215.5928962044768},{\"x\":571.1091291960857,\"y\":131.9339140362223},{\"x\":395.1080281321827,\"y\":74.31970933544322},{\"x\":239.62723481564063,\"y\":53.799581633795896},{\"x\":41.527340793041276,\"y\":80.63359478210394},{\"x\":40.73809818737355,\"y\":418.42646617845236}]",
+        0,
+        ""
+      ]
+    },
+    {
+      "id": 4,
+      "type": "SAM3AddPrompt",
+      "pos": [
+        3571.000847526362,
+        -2284.093561265211
+      ],
+      "size": [
+        270,
+        162
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "video_state",
+          "type": "SAM3_VIDEO_STATE",
+          "link": 11
+        },
+        {
+          "name": "positive_points",
+          "shape": 7,
+          "type": "SAM3_POINTS_PROMPT",
+          "link": 30
+        },
+        {
+          "name": "negative_points",
+          "shape": 7,
+          "type": "SAM3_POINTS_PROMPT",
+          "link": 31
+        },
+        {
+          "name": "positive_boxes",
+          "shape": 7,
+          "type": "SAM3_BOXES_PROMPT",
+          "link": null
+        },
+        {
+          "name": "negative_boxes",
+          "shape": 7,
+          "type": "SAM3_BOXES_PROMPT",
+          "link": null
+        },
+        {
+          "name": "frame_idx",
+          "type": "INT",
+          "widget": {
+            "name": "frame_idx"
+          },
+          "link": 36
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_state",
+          "type": "SAM3_VIDEO_STATE",
+          "links": [
+            37
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/ComfyUI-SAM3_nvFork",
+        "ver": "f39906d1f98da3040acf9163587ed238d0488f16",
+        "Node name for S&R": "SAM3AddPrompt"
+      },
+      "widgets_values": [
+        0,
+        -1
+      ]
+    },
+    {
+      "id": 22,
+      "type": "MarkdownNote",
+      "pos": [
+        3547.983298772445,
+        -2056.6054573291385
+      ],
+      "size": [
+        312.96642991719045,
+        257.6759199053604
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "# You are also able to add additional context to your tracking job, with add prompt however more frames does incur a performance hit"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2,
+      "type": "LoadSAM3Model",
+      "pos": [
+        1419.7867972380611,
+        -1769.896064345075
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "sam3_model",
+          "type": "SAM3_MODEL",
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/ComfyUI-SAM3_nvFork",
+        "ver": "f39906d1f98da3040acf9163587ed238d0488f16",
+        "Node name for S&R": "LoadSAM3Model"
+      },
+      "widgets_values": [
+        "models/sam3/sam3.pt",
+        ""
+      ]
+    },
+    {
+      "id": 5,
+      "type": "SAM3Propagate",
+      "pos": [
+        3958.360759481864,
+        -1582.2550613536237
+      ],
+      "size": [
+        288.68333435058594,
+        470
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "sam3_model",
+          "type": "SAM3_MODEL",
+          "link": 13
+        },
+        {
+          "name": "video_state",
+          "type": "SAM3_VIDEO_STATE",
+          "link": 37
+        }
+      ],
+      "outputs": [
+        {
+          "name": "masks",
+          "type": "SAM3_VIDEO_MASKS",
+          "links": [
+            14
+          ]
+        },
+        {
+          "name": "scores",
+          "type": "SAM3_VIDEO_SCORES",
+          "links": [
+            16
+          ]
+        },
+        {
+          "name": "video_state",
+          "type": "SAM3_VIDEO_STATE",
+          "links": [
+            15
+          ]
+        },
+        {
+          "name": "track_info",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "mask_dir",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "obj_ids",
+          "type": "SAM3_VIDEO_OBJ_IDS",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/ComfyUI-SAM3_nvFork",
+        "ver": "f39906d1f98da3040acf9163587ed238d0488f16",
+        "Node name for S&R": "SAM3Propagate"
+      },
+      "widgets_values": [
+        0,
+        -1,
+        -1,
+        "forward",
+        false,
+        false,
+        250,
+        false,
+        false,
+        "",
+        false,
+        0.5,
+        30,
+        true
+      ]
+    },
+    {
+      "id": 6,
+      "type": "NV_SAM3MaskTracks",
+      "pos": [
+        4423.910615520627,
+        -1523.2376547587007
+      ],
+      "size": [
+        270,
+        166
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "masks",
+          "type": "SAM3_VIDEO_MASKS",
+          "link": 14
+        },
+        {
+          "name": "video_state",
+          "type": "SAM3_VIDEO_STATE",
+          "link": 15
+        },
+        {
+          "name": "scores",
+          "shape": 7,
+          "type": "SAM3_VIDEO_SCORES",
+          "link": 16
+        }
+      ],
+      "outputs": [
+        {
+          "name": "all_masks",
+          "type": "MASK",
+          "links": [
+            17
+          ]
+        },
+        {
+          "name": "bbox_masks",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "track_info",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "num_objects",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/ComfyUI-SAM3_nvFork",
+        "ver": "f39906d1f98da3040acf9163587ed238d0488f16",
+        "Node name for S&R": "NV_SAM3MaskTracks"
+      },
+      "widgets_values": [
+        100,
+        false,
+        0
+      ]
+    },
+    {
+      "id": 7,
+      "type": "NV_SAM3AutoCleanup",
+      "pos": [
+        4844.796521728272,
+        -1528.0945648269098
+      ],
+      "size": [
+        270,
+        78
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "masks",
+          "type": "MASK",
+          "link": 17
+        }
+      ],
+      "outputs": [
+        {
+          "name": "masks",
+          "type": "MASK",
+          "links": [
+            18
+          ]
+        },
+        {
+          "name": "items_cleared",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "neonvoid/ComfyUI-SAM3_nvFork",
+        "ver": "f39906d1f98da3040acf9163587ed238d0488f16",
+        "Node name for S&R": "NV_SAM3AutoCleanup"
+      },
+      "widgets_values": [
+        true
+      ]
+    },
+    {
+      "id": 13,
+      "type": "PreviewAnimation",
+      "pos": [
+        5884.019466997768,
+        -1688.4495020271881
+      ],
+      "size": [
+        270,
+        78
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 22
+        },
+        {
+          "name": "masks",
+          "shape": 7,
+          "type": "MASK",
+          "link": 21
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": 20
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfyui-kjnodes",
+        "ver": "c661baadd9683c0033cd2a6ad90157c6d099a6c2",
+        "Node name for S&R": "PreviewAnimation"
+      },
+      "widgets_values": [
+        0.01
+      ]
+    }
+  ],
+  "links": [
+    [
+      2,
+      1,
+      0,
+      11,
+      0,
+      "IMAGE"
+    ],
+    [
+      5,
+      1,
+      0,
+      12,
+      0,
+      "IMAGE"
+    ],
+    [
+      10,
+      11,
+      3,
+      12,
+      5,
+      "INT"
+    ],
+    [
+      11,
+      12,
+      0,
+      4,
+      0,
+      "SAM3_VIDEO_STATE"
+    ],
+    [
+      13,
+      2,
+      0,
+      5,
+      0,
+      "SAM3_MODEL"
+    ],
+    [
+      14,
+      5,
+      0,
+      6,
+      0,
+      "SAM3_VIDEO_MASKS"
+    ],
+    [
+      15,
+      5,
+      2,
+      6,
+      1,
+      "SAM3_VIDEO_STATE"
+    ],
+    [
+      16,
+      5,
+      1,
+      6,
+      2,
+      "SAM3_VIDEO_SCORES"
+    ],
+    [
+      17,
+      6,
+      0,
+      7,
+      0,
+      "MASK"
+    ],
+    [
+      18,
+      7,
+      0,
+      8,
+      0,
+      "MASK"
+    ],
+    [
+      19,
+      1,
+      3,
+      14,
+      0,
+      "VHS_VIDEOINFO"
+    ],
+    [
+      20,
+      14,
+      0,
+      13,
+      2,
+      "FLOAT"
+    ],
+    [
+      21,
+      8,
+      0,
+      13,
+      1,
+      "MASK"
+    ],
+    [
+      22,
+      1,
+      0,
+      13,
+      0,
+      "IMAGE"
+    ],
+    [
+      23,
+      14,
+      0,
+      15,
+      2,
+      "FLOAT"
+    ],
+    [
+      24,
+      8,
+      2,
+      15,
+      0,
+      "IMAGE"
+    ],
+    [
+      25,
+      1,
+      0,
+      18,
+      0,
+      "IMAGE"
+    ],
+    [
+      26,
+      18,
+      1,
+      12,
+      3,
+      "SAM3_BOXES_PROMPT"
+    ],
+    [
+      30,
+      19,
+      0,
+      4,
+      1,
+      "SAM3_POINTS_PROMPT"
+    ],
+    [
+      31,
+      19,
+      1,
+      4,
+      2,
+      "SAM3_POINTS_PROMPT"
+    ],
+    [
+      32,
+      11,
+      0,
+      12,
+      1,
+      "SAM3_POINTS_PROMPT"
+    ],
+    [
+      33,
+      11,
+      1,
+      12,
+      2,
+      "SAM3_POINTS_PROMPT"
+    ],
+    [
+      34,
+      18,
+      1,
+      12,
+      3,
+      "SAM3_BOXES_PROMPT"
+    ],
+    [
+      35,
+      18,
+      2,
+      12,
+      4,
+      "SAM3_BOXES_PROMPT"
+    ],
+    [
+      36,
+      19,
+      3,
+      4,
+      5,
+      "INT"
+    ],
+    [
+      37,
+      4,
+      0,
+      5,
+      1,
+      "SAM3_VIDEO_STATE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 0.7358232885633386,
+      "offset": [
+        -2312.55749993144,
+        2276.0462063856194
+      ]
+    },
+    "frontendVersion": "1.38.14",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}

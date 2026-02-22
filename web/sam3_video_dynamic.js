@@ -225,23 +225,30 @@ app.registerExtension({
 
     async nodeCreated(node) {
         if (node.comfyClass === "SAM3VideoSegmentation") {
-            // Store reference to extension for configure callback
             const ext = this;
+            node._sam3_configured = false;
 
             // Hook into configure to handle workflow reload
             const origConfigure = node.configure;
             node.configure = function(data) {
+                node._sam3_configured = true;
                 const result = origConfigure?.apply(this, arguments);
-                // Re-setup after workflow loads
-                setTimeout(() => {
+                // Run after configure fully completes and DOM settles
+                requestAnimationFrame(() => {
                     ext.setupVideoSegmentation(node);
-                }, 150);
+                });
                 return result;
             };
 
-            setTimeout(() => {
-                this.setupVideoSegmentation(node);
-            }, 100);
+            // Fresh node only (not workflow reload)
+            // Double rAF ensures configure has had a chance to run first
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    if (!node._sam3_configured) {
+                        ext.setupVideoSegmentation(node);
+                    }
+                });
+            });
         }
     },
 

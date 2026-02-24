@@ -14,7 +14,8 @@ Key design principles:
 import weakref
 import gc
 import torch
-from typing import Optional, Dict, Any
+from collections import OrderedDict
+from typing import Optional, Dict, Any, List, Tuple
 
 from .video_state import SAM3VideoState, VideoPrompt
 
@@ -107,8 +108,12 @@ class InferenceReconstructor:
         )
         print_vram("After start_session")
 
-        # Re-apply all prompts in order using session_id
-        for prompt in video_state.prompts:
+        # Re-apply all prompts, merging point+box prompts that share (frame_idx, obj_id).
+        # This is critical: each add_prompt call uses clear_old_points=True internally,
+        # so separate calls for points and boxes on the same object would cause the
+        # second call to erase the first. We merge them into a single call instead.
+        merged_prompts = self._merge_point_and_box_prompts(video_state.prompts)
+        for prompt in merged_prompts:
             self._apply_prompt(model, video_state.session_uuid, prompt)
             print_vram(f"After apply prompt obj={prompt.obj_id}")
 
@@ -132,6 +137,82 @@ class InferenceReconstructor:
         model.model.hotstart_delay = config.hotstart_delay
         model.model.decrease_trk_keep_alive_for_empty_masklets = config.decrease_keep_alive_empty
         model.model.suppress_unmatched_only_within_hotstart = not config.suppress_unmatched_globally
+
+    def _merge_point_and_box_prompts(self, prompts: Tuple[VideoPrompt, ...]) -> List[VideoPrompt]:
+        """
+        Merge point and box prompts that share the same (frame_idx, obj_id).
+
+        SAM3's tracker uses clear_old_points=True on each add_prompt call, so if we
+        apply a point prompt and then a box prompt separately for the same object on
+        the same frame, the box call erases the point data. By merging them into a
+        single point prompt (box corners first with labels [2,3], then click points),
+        everything goes in one call and nothing is lost.
+
+        Text and mask prompts are passed through unchanged since they use different
+        API paths.
+
+        Returns:
+            List of prompts with point+box merged where applicable.
+        """
+        # Separate mergeable (point/box) from non-mergeable (text/mask) prompts
+        # Use OrderedDict to preserve insertion order by (frame_idx, obj_id)
+        merge_groups: OrderedDict[Tuple[int, int], dict] = OrderedDict()
+        other_prompts: List[Tuple[int, VideoPrompt]] = []  # (original_index, prompt)
+
+        for i, prompt in enumerate(prompts):
+            if prompt.prompt_type in ("point", "box"):
+                key = (prompt.frame_idx, prompt.obj_id)
+                if key not in merge_groups:
+                    merge_groups[key] = {"box_points": [], "box_labels": [],
+                                         "click_points": [], "click_labels": [],
+                                         "first_index": i}
+                group = merge_groups[key]
+
+                if prompt.prompt_type == "point":
+                    points, labels = prompt.data
+                    for p in points:
+                        group["click_points"].append(list(p))
+                    for l in labels:
+                        group["click_labels"].append(int(l))
+
+                elif prompt.prompt_type == "box":
+                    # Extract box coords and convert to corner points
+                    if isinstance(prompt.data[0], (list, tuple)) or (len(prompt.data) == 2 and isinstance(prompt.data[1], bool)):
+                        box = list(prompt.data[0])
+                    else:
+                        box = list(prompt.data)
+                    x1, y1, x2, y2 = box
+                    # Box corners go first (labels 2=top-left, 3=bottom-right)
+                    # to match SAM2/SAM3's training convention
+                    group["box_points"].extend([[x1, y1], [x2, y2]])
+                    group["box_labels"].extend([2, 3])
+            else:
+                other_prompts.append((i, prompt))
+
+        # Build merged prompts
+        result: List[Tuple[int, VideoPrompt]] = []
+
+        for (frame_idx, obj_id), group in merge_groups.items():
+            # SAM2/3 convention: box corners first, then click points
+            all_points = group["box_points"] + group["click_points"]
+            all_labels = group["box_labels"] + group["click_labels"]
+
+            if all_points:
+                merged = VideoPrompt.create_point(frame_idx, obj_id, all_points, all_labels)
+                result.append((group["first_index"], merged))
+
+                n_box = len(group["box_points"]) // 2
+                n_click = len(group["click_points"])
+                if n_box > 0 and n_click > 0:
+                    print(f"[SAM3 Video] Merged {n_click} click points + {n_box} box(es) "
+                          f"for obj={obj_id} frame={frame_idx} into single prompt "
+                          f"({len(all_points)} total points)")
+
+        # Combine and sort by original insertion order
+        result.extend(other_prompts)
+        result.sort(key=lambda x: x[0])
+
+        return [prompt for _, prompt in result]
 
     def _apply_prompt(self, model, session_id: str, prompt: VideoPrompt):
         """Apply a single prompt to inference state using the predictor's API."""

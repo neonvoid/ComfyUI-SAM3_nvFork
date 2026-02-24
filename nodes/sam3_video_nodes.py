@@ -748,22 +748,31 @@ class SAM3AddPrompt:
                           f"points={len(all_points)}")
                     prompts_added += 1
 
-        # Handle box prompts
+        # Handle box prompts (convert from center format [cx, cy, w, h] to corner format [x1, y1, x2, y2])
         if positive_boxes and positive_boxes.get("boxes"):
-            for box in positive_boxes["boxes"]:
-                box_coords = [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
-                prompt = VideoPrompt.create_box(frame_idx, obj_id, box_coords, is_positive=True)
+            for box_data in positive_boxes["boxes"]:
+                cx, cy, w, h = box_data
+                x1 = cx - w/2
+                y1 = cy - h/2
+                x2 = cx + w/2
+                y2 = cy + h/2
+                prompt = VideoPrompt.create_box(frame_idx, obj_id, [x1, y1, x2, y2], is_positive=True)
                 video_state = video_state.with_prompt(prompt)
-                print(f"[SAM3 AddPrompt] Added positive box: frame={frame_idx}, obj={obj_id}")
+                print(f"[SAM3 AddPrompt] Added positive box: frame={frame_idx}, obj={obj_id}, "
+                      f"box=[{x1:.3f}, {y1:.3f}, {x2:.3f}, {y2:.3f}]")
                 prompts_added += 1
-                obj_id += 1
 
         if negative_boxes and negative_boxes.get("boxes"):
-            for box in negative_boxes["boxes"]:
-                box_coords = [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
-                prompt = VideoPrompt.create_box(frame_idx, obj_id, box_coords, is_positive=False)
+            for box_data in negative_boxes["boxes"]:
+                cx, cy, w, h = box_data
+                x1 = cx - w/2
+                y1 = cy - h/2
+                x2 = cx + w/2
+                y2 = cy + h/2
+                prompt = VideoPrompt.create_box(frame_idx, obj_id, [x1, y1, x2, y2], is_positive=False)
                 video_state = video_state.with_prompt(prompt)
-                print(f"[SAM3 AddPrompt] Added negative box: frame={frame_idx}, obj={obj_id}")
+                print(f"[SAM3 AddPrompt] Added negative box: frame={frame_idx}, obj={obj_id}, "
+                      f"box=[{x1:.3f}, {y1:.3f}, {x2:.3f}, {y2:.3f}]")
                 prompts_added += 1
 
         print(f"[SAM3 AddPrompt] Total prompts added: {prompts_added}")

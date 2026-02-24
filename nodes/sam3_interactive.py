@@ -55,6 +55,9 @@ class SAM3PointCollector:
                     "max": 99999,
                     "tooltip": "Frame index to display from video batch (0 = first frame). Output connects directly to SAM3VideoSegmentation's frame_idx."
                 }),
+                "mask": ("MASK", {
+                    "tooltip": "Optional mask sequence to overlay on the image. Masked regions are shown with a colored tint so you can see what's already covered and click on areas that need fixing."
+                }),
             },
         }
 
@@ -65,7 +68,7 @@ class SAM3PointCollector:
     OUTPUT_NODE = True  # Makes node executable even without outputs connected
 
     @classmethod
-    def IS_CHANGED(cls, image, points_store, coordinates, neg_coordinates, frame_index=0):
+    def IS_CHANGED(cls, image, points_store, coordinates, neg_coordinates, frame_index=0, mask=None):
         # Return hash based on actual point content, not object identity
         # This ensures downstream nodes don't re-run when points haven't changed
         import hashlib
@@ -74,12 +77,13 @@ class SAM3PointCollector:
         h.update(coordinates.encode())
         h.update(neg_coordinates.encode())
         h.update(str(frame_index).encode())
+        if mask is not None:
+            h.update(str(mask.shape).encode())
+            h.update(str(id(mask)).encode())
         result = h.hexdigest()
-        print(f"[IS_CHANGED DEBUG] SAM3PointCollector: shape={image.shape}, coords={coordinates}, neg_coords={neg_coordinates}, frame={frame_index}")
-        print(f"[IS_CHANGED DEBUG] SAM3PointCollector: returning hash={result}")
         return result
 
-    def collect_points(self, image, points_store, coordinates, neg_coordinates, frame_index=0):
+    def collect_points(self, image, points_store, coordinates, neg_coordinates, frame_index=0, mask=None):
         """
         Collect points from interactive canvas
 
@@ -91,6 +95,7 @@ class SAM3PointCollector:
             coordinates: Positive points JSON (hidden widget) - legacy format
             neg_coordinates: Negative points JSON (hidden widget) - legacy format
             frame_index: Frame index to display from video batch (0 = first frame)
+            mask: Optional mask tensor [N, H, W] to overlay on the displayed frame
 
         Returns:
             Tuple of (positive_points, negative_points, object_count, frame_index, total_frames)
@@ -113,7 +118,7 @@ class SAM3PointCollector:
             cached = SAM3PointCollector._cache[cache_key]
             print(f"[SAM3 Point Collector] CACHE HIT - returning cached result for key={cache_key[:8]}")
             # Still need to return UI update
-            img_base64 = self.tensor_to_base64(image, frame_index)
+            img_base64 = self.tensor_to_base64(image, frame_index, mask=mask)
             return {
                 "ui": {"bg_image": [img_base64], "total_frames": [total_frames]},
                 "result": cached  # Return the SAME objects
@@ -218,21 +223,30 @@ class SAM3PointCollector:
         SAM3PointCollector._cache[cache_key] = result
 
         # Send image back to widget as base64
-        img_base64 = self.tensor_to_base64(image, frame_index)
+        img_base64 = self.tensor_to_base64(image, frame_index, mask=mask)
 
         return {
             "ui": {"bg_image": [img_base64], "total_frames": [total_frames]},
             "result": result
         }
 
-    def tensor_to_base64(self, tensor, frame_index=0):
-        """Convert ComfyUI image tensor to base64 string for JavaScript widget"""
+    def tensor_to_base64(self, tensor, frame_index=0, mask=None):
+        """Convert ComfyUI image tensor to base64 string for JavaScript widget.
+
+        If a mask is provided, composites it as a semi-transparent colored overlay
+        so the user can see which regions are already masked.
+        """
         # Convert from [B, H, W, C] to PIL Image
         # Select the requested frame (clamped to valid range)
         frame_index = min(frame_index, tensor.shape[0] - 1)
         img_array = tensor[frame_index].cpu().numpy()
         # Convert from 0-1 float to 0-255 uint8
         img_array = (img_array * 255).astype(np.uint8)
+
+        # Overlay mask if provided
+        if mask is not None:
+            img_array = self._overlay_mask(img_array, mask, frame_index)
+
         pil_img = Image.fromarray(img_array)
 
         # Convert to base64
@@ -242,6 +256,53 @@ class SAM3PointCollector:
         img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
         return img_base64
+
+    @staticmethod
+    def _overlay_mask(img_array, mask_tensor, frame_index, color=(0, 180, 255), alpha=0.35):
+        """Composite a mask as a semi-transparent colored overlay on the image.
+
+        Args:
+            img_array: uint8 numpy array [H, W, 3]
+            mask_tensor: torch tensor [N, H, W] or [H, W]
+            frame_index: which frame to extract from the mask batch
+            color: RGB tuple for the overlay tint
+            alpha: overlay opacity (0=invisible, 1=opaque)
+
+        Returns:
+            uint8 numpy array [H, W, 3] with mask overlay composited
+        """
+        import torch
+
+        # Extract the correct frame from the mask batch
+        if mask_tensor.dim() == 3:
+            fi = min(frame_index, mask_tensor.shape[0] - 1)
+            frame_mask = mask_tensor[fi].cpu().numpy()
+        elif mask_tensor.dim() == 2:
+            frame_mask = mask_tensor.cpu().numpy()
+        else:
+            return img_array  # Unexpected shape, skip overlay
+
+        # Normalize to 0-1 if needed
+        if frame_mask.max() > 1.0:
+            frame_mask = frame_mask / 255.0
+
+        # Resize mask if dimensions don't match image
+        h, w = img_array.shape[:2]
+        mh, mw = frame_mask.shape[:2]
+        if mh != h or mw != w:
+            mask_t = torch.from_numpy(frame_mask).float().unsqueeze(0).unsqueeze(0)
+            mask_t = torch.nn.functional.interpolate(mask_t, size=(h, w), mode='bilinear', align_corners=False)
+            frame_mask = mask_t.squeeze().numpy()
+
+        # Create binary mask (threshold at 0.5)
+        binary = (frame_mask > 0.5).astype(np.float32)
+
+        # Composite: img * (1 - alpha*mask) + color * (alpha*mask)
+        overlay = img_array.astype(np.float32)
+        for c in range(3):
+            overlay[:, :, c] = overlay[:, :, c] * (1.0 - alpha * binary) + color[c] * (alpha * binary)
+
+        return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
 class SAM3BBoxCollector:
@@ -277,6 +338,9 @@ class SAM3BBoxCollector:
                     "max": 99999,
                     "tooltip": "Frame index to display from video batch (0 = first frame). Output connects directly to SAM3VideoSegmentation's frame_idx."
                 }),
+                "mask": ("MASK", {
+                    "tooltip": "Optional mask sequence to overlay on the image. Masked regions are shown with a colored tint so you can see what's already covered and draw boxes on areas that need fixing."
+                }),
             },
         }
 
@@ -287,7 +351,7 @@ class SAM3BBoxCollector:
     OUTPUT_NODE = True  # Makes node executable even without outputs connected
 
     @classmethod
-    def IS_CHANGED(cls, image, bboxes, neg_bboxes, frame_index=0):
+    def IS_CHANGED(cls, image, bboxes, neg_bboxes, frame_index=0, mask=None):
         # Return hash based on actual bbox content, not object identity
         # This ensures downstream nodes don't re-run when bboxes haven't changed
         import hashlib
@@ -296,12 +360,13 @@ class SAM3BBoxCollector:
         h.update(bboxes.encode())
         h.update(neg_bboxes.encode())
         h.update(str(frame_index).encode())
+        if mask is not None:
+            h.update(str(mask.shape).encode())
+            h.update(str(id(mask)).encode())
         result = h.hexdigest()
-        print(f"[IS_CHANGED DEBUG] SAM3BBoxCollector: shape={image.shape}, bboxes={bboxes}, neg_bboxes={neg_bboxes}, frame={frame_index}")
-        print(f"[IS_CHANGED DEBUG] SAM3BBoxCollector: returning hash={result}")
         return result
 
-    def collect_bboxes(self, image, bboxes, neg_bboxes, frame_index=0):
+    def collect_bboxes(self, image, bboxes, neg_bboxes, frame_index=0, mask=None):
         """
         Collect bounding boxes from interactive canvas
 
@@ -310,6 +375,7 @@ class SAM3BBoxCollector:
             bboxes: Positive BBoxes JSON array (hidden widget)
             neg_bboxes: Negative BBoxes JSON array (hidden widget)
             frame_index: Frame index to display from video batch (0 = first frame)
+            mask: Optional mask tensor [N, H, W] to overlay on the displayed frame
 
         Returns:
             Tuple of (positive_bboxes, negative_bboxes, frame_index, total_frames)
@@ -331,7 +397,7 @@ class SAM3BBoxCollector:
             cached = SAM3BBoxCollector._cache[cache_key]
             print(f"[SAM3 BBox Collector] CACHE HIT - returning cached result for key={cache_key[:8]}")
             # Still need to return UI update
-            img_base64 = self.tensor_to_base64(image, frame_index)
+            img_base64 = self.tensor_to_base64(image, frame_index, mask=mask)
             return {
                 "ui": {"bg_image": [img_base64], "total_frames": [total_frames]},
                 "result": cached  # Return the SAME objects
@@ -415,21 +481,30 @@ class SAM3BBoxCollector:
         SAM3BBoxCollector._cache[cache_key] = result
 
         # Send image back to widget as base64
-        img_base64 = self.tensor_to_base64(image, frame_index)
+        img_base64 = self.tensor_to_base64(image, frame_index, mask=mask)
 
         return {
             "ui": {"bg_image": [img_base64], "total_frames": [total_frames]},
             "result": result
         }
 
-    def tensor_to_base64(self, tensor, frame_index=0):
-        """Convert ComfyUI image tensor to base64 string for JavaScript widget"""
+    def tensor_to_base64(self, tensor, frame_index=0, mask=None):
+        """Convert ComfyUI image tensor to base64 string for JavaScript widget.
+
+        If a mask is provided, composites it as a semi-transparent colored overlay
+        so the user can see which regions are already masked.
+        """
         # Convert from [B, H, W, C] to PIL Image
         # Select the requested frame (clamped to valid range)
         frame_index = min(frame_index, tensor.shape[0] - 1)
         img_array = tensor[frame_index].cpu().numpy()
         # Convert from 0-1 float to 0-255 uint8
         img_array = (img_array * 255).astype(np.uint8)
+
+        # Overlay mask if provided (reuse PointCollector's static method)
+        if mask is not None:
+            img_array = SAM3PointCollector._overlay_mask(img_array, mask, frame_index)
+
         pil_img = Image.fromarray(img_array)
 
         # Convert to base64

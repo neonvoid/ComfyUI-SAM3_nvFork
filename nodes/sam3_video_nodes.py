@@ -3074,6 +3074,8 @@ class SAM3MaskRefine:
                     torch.cuda.empty_cache()
             return SAM3MaskRefine._cache[cache_key]
 
+        import time as _time
+        _t_start = _time.time()
         print(f"[SAM3 MaskRefine] CACHE MISS - running refinement")
         print_vram("Before mask refine")
 
@@ -3098,8 +3100,9 @@ class SAM3MaskRefine:
             video_frames=working_frames,
             config=config,
         )
+        _t_state = _time.time()
         print(f"[SAM3 MaskRefine] Session {video_state.session_uuid[:8]}: "
-              f"{num_frames} frames, {w}x{h}")
+              f"{num_frames} frames, {w}x{h} ({_t_state - _t_start:.1f}s)")
 
         # --- Step 2: Add mask prompts at keyframe intervals ---
         # Determine which frames have corrective prompts so we skip those.
@@ -3247,9 +3250,14 @@ class SAM3MaskRefine:
 
         with autocast_context:
             print_vram("Before reconstruction")
+            _t_recon = _time.time()
             inference_state = get_inference_state(sam3_model, video_state)
+            print(f"[SAM3 MaskRefine] State reconstruction: {_time.time() - _t_recon:.1f}s")
             print_vram("After reconstruction")
 
+            _t_prop = _time.time()
+            _frames_processed = 0
+            _log_interval = max(1, num_frames // 10)  # Log ~10 times during propagation
             try:
                 for response in sam3_model.handle_stream_request(request):
                     comfy.model_management.throw_exception_if_processing_interrupted()
@@ -3278,6 +3286,15 @@ class SAM3MaskRefine:
                         del outputs[mask_key]
 
                     outputs.clear()
+                    _frames_processed += 1
+
+                    if _frames_processed % _log_interval == 0 or _frames_processed == num_frames:
+                        _elapsed = _time.time() - _t_prop
+                        _pct = (_frames_processed / num_frames) * 100
+                        _fps = _frames_processed / max(_elapsed, 0.001)
+                        _eta = (num_frames - _frames_processed) / max(_fps, 0.001)
+                        print(f"[SAM3 MaskRefine] Propagating: {_frames_processed}/{num_frames} "
+                              f"({_pct:.0f}%) | {_fps:.1f} fps | ETA {_eta:.0f}s")
 
                     if frame_index % 16 == 0:
                         gc.collect()
@@ -3285,16 +3302,23 @@ class SAM3MaskRefine:
                             torch.cuda.empty_cache()
 
             except Exception as e:
-                print(f"[SAM3 MaskRefine] Propagation error: {e}")
+                print(f"[SAM3 MaskRefine] Propagation error at frame {_frames_processed}: {e}")
                 import traceback
                 traceback.print_exc()
                 raise
 
+        _prop_time = _time.time() - _t_prop
         print_vram("After propagation")
-        print(f"[SAM3 MaskRefine] Propagation complete: {len(refined_masks)} frames")
+        print(f"[SAM3 MaskRefine] Propagation complete: {len(refined_masks)} frames "
+              f"in {_prop_time:.1f}s ({len(refined_masks)/max(_prop_time, 0.001):.1f} fps)")
 
         # --- Step 6: Merge refined masks with originals ---
+        _t_merge = _time.time()
         merged_list = []
+        _total_original_px = 0
+        _total_refined_px = 0
+        _total_merged_px = 0
+        _frames_with_change = 0
         for fi in range(num_frames):
             original_mask = input_masks[fi].float().cpu()
 
@@ -3336,13 +3360,35 @@ class SAM3MaskRefine:
                     merged = torch.min(original_mask, raw_refined)
                 else:
                     merged = torch.max(original_mask, raw_refined)
+
+                # Track coverage stats
+                orig_px = (original_mask > 0.5).sum().item()
+                ref_px = (raw_refined > 0.5).sum().item()
+                merge_px = (merged > 0.5).sum().item()
+                _total_original_px += orig_px
+                _total_refined_px += ref_px
+                _total_merged_px += merge_px
+                if merge_px != orig_px:
+                    _frames_with_change += 1
             else:
                 # No refined mask for this frame - keep original
                 merged = original_mask
+                _total_original_px += (original_mask > 0.5).sum().item()
+                _total_merged_px += (original_mask > 0.5).sum().item()
 
             merged_list.append(merged)
 
         all_masks = torch.stack(merged_list, dim=0)
+
+        # Log merge stats
+        _merge_time = _time.time() - _t_merge
+        _avg_orig = _total_original_px / max(num_frames, 1)
+        _avg_merged = _total_merged_px / max(num_frames, 1)
+        _change_pct = ((_total_merged_px - _total_original_px) / max(_total_original_px, 1)) * 100
+        print(f"[SAM3 MaskRefine] Merge ({merge_mode}): {_merge_time:.1f}s | "
+              f"{_frames_with_change}/{num_frames} frames changed")
+        print(f"[SAM3 MaskRefine] Coverage: original avg {_avg_orig:.0f}px → "
+              f"merged avg {_avg_merged:.0f}px ({_change_pct:+.1f}%)")
 
         # --- Step 7: Visualization ---
         visualization = self._create_visualization(working_frames.cpu(), all_masks)
@@ -3366,7 +3412,8 @@ class SAM3MaskRefine:
         result = (all_masks, visualization)
         SAM3MaskRefine._cache[cache_key] = result
 
-        print(f"[SAM3 MaskRefine] Done. Output: {all_masks.shape}")
+        _total_time = _time.time() - _t_start
+        print(f"[SAM3 MaskRefine] Done. Output: {all_masks.shape} | Total: {_total_time:.1f}s")
         print_vram("After mask refine complete")
 
         return result

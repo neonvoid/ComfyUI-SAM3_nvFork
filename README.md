@@ -54,6 +54,7 @@ NV SAM3 Auto Cleanup
 | SAM3 VRAM Estimator | Estimate memory requirements before running |
 | SAM3 Mask Loader | Load masks saved to disk (stream-to-disk mode) |
 | SAM3 Mask to Video | Create visualization overlay from masks |
+| SAM3 Mask Refine | Refine existing masks by feeding them back into SAM3 |
 
 ### Mask Extraction & Processing (Fork additions)
 | Node | Purpose |
@@ -93,6 +94,7 @@ NV SAM3 Auto Cleanup
 - Fixed NMS OOM on scenes with many detection candidates
 - Fixed point+box prompt merging — points and boxes on the same object are now combined into a single API call (previously `clear_old_points=True` caused the box call to erase click points)
 - Fixed bbox coordinate conversion in SAM3 Add Prompt (was passing center-format `[cx,cy,w,h]` raw instead of converting to corner-format `[x1,y1,x2,y2]`)
+- Fixed `add_new_mask()` in video predictor wrapper — was calling `self.model.add_new_mask()` which doesn't exist on `Sam3VideoInferenceWithInstanceInteractivity`; now correctly routes through `self.model.tracker.add_new_mask()`
 
 **New nodes:**
 - Per-object mask extraction with metadata (NV SAM3 Mask Tracks)
@@ -101,6 +103,7 @@ NV SAM3 Auto Cleanup
 - Progressive batch output (NV SAM3 Progressive Batcher)
 - Automatic session cleanup (NV SAM3 Auto Cleanup)
 - VRAM estimation, session debugging, preset save/load
+- Mask refinement — feed first-pass masks back into SAM3 to refine and fill gaps (SAM3 Mask Refine)
 
 **Architecture changes:**
 - Immutable video state (no global mutable state between nodes)
@@ -112,6 +115,23 @@ NV SAM3 Auto Cleanup
 ### Combining points and boxes
 
 You can plug both a **SAM3 Point Collector** and a **SAM3 BBox Collector** into the same **SAM3 Video Segmentation** (or **SAM3 Add Prompt**) node. The bbox acts as a region constraint while click points provide precise foreground/background guidance within that region. Internally, box corners are encoded as special point labels (`2`=top-left, `3`=bottom-right) and merged with your click points into a single prompt — matching how SAM2/SAM3 was trained.
+
+### Mask Refinement (Two-Pass)
+
+When the first pass gets ~85% of the mask right, feed the result back in with **SAM3 Mask Refine** to catch the rest:
+
+```
+SAM3 Video Segmentation → SAM3 Propagate → SAM3 Video Output → masks
+                                                                  ↓
+Load Video → video_frames → SAM3 Mask Refine ←── masks (+ optional corrective clicks)
+                                 ↓
+                          refined masks (union of original + SAM3 refinement)
+```
+
+Key parameters:
+- `keyframe_interval`: Seed SAM3 with a mask every N frames (default 10). Lower = closer to original, higher = more freedom.
+- `merge_mode`: `union` (default, adds regions), `replace`, or `intersect`
+- Optional corrective points/boxes for manual fixes on any frame
 
 ### Multi-frame corrections
 

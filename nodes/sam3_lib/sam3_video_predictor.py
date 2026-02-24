@@ -237,20 +237,17 @@ class Sam3VideoPredictor:
             mask_tensor = mask_tensor.squeeze()
         assert mask_tensor.dim() == 2, f"Mask must be 2D, got {mask_tensor.dim()}D"
 
-        # Call the tracker's add_new_mask method
-        # Note: add_new_mask lives on the tracker (Sam3TrackingPredictor), not
-        # on the model (Sam3VideoInferenceWithInstanceInteractivity) directly.
-        frame_idx, obj_ids, low_res_masks, video_res_masks = self.model.tracker.add_new_mask(
+        # Route through the model layer which handles tracker state routing.
+        # The model has a two-tier inference state: model-level (from init_state)
+        # and tracker-level (per-object, with obj_id_to_idx). add_tracker_new_mask
+        # finds/creates the correct tracker state and calls tracker.add_new_mask.
+        frame_idx, outputs = self.model.add_tracker_new_mask(
             inference_state=inference_state,
             frame_idx=frame_idx,
             obj_id=obj_id,
             mask=mask_tensor,
         )
 
-        outputs = {
-            "obj_ids": obj_ids,
-            "video_res_masks": video_res_masks,
-        }
         return {"frame_index": frame_idx, "outputs": outputs}
 
     def remove_object(

@@ -1437,6 +1437,147 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             )
 
     @torch.inference_mode()
+    def add_tracker_new_mask(
+        self,
+        inference_state,
+        frame_idx,
+        obj_id,
+        mask,
+    ):
+        """Add a new mask prompt to the Tracker.
+
+        Similar to add_tracker_new_points but for mask input. Creates a new
+        tracker inference state if the object hasn't been seen before, then
+        routes to the correct tracker-level state for add_new_mask.
+        """
+        assert obj_id is not None, "obj_id must be provided to add new mask"
+        tracker_metadata = inference_state["tracker_metadata"]
+        if tracker_metadata == {}:
+            tracker_metadata.update(self._initialize_metadata())
+
+        obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
+
+        if obj_rank is None:
+            # New object — create tracker state
+            num_prev_obj = np.sum(tracker_metadata["num_obj_per_gpu"])
+            if num_prev_obj >= self.max_num_objects:
+                logger.warning(
+                    f"add_tracker_new_mask: cannot add a new object as we are already tracking {num_prev_obj=} "
+                    f"masklets (under {self.max_num_objects=})"
+                )
+                obj_ids = []
+                H_video_res = inference_state["orig_height"]
+                W_video_res = inference_state["orig_width"]
+                video_res_masks = torch.zeros(0, 1, H_video_res, W_video_res)
+                return frame_idx, {"obj_ids": obj_ids, "video_res_masks": video_res_masks}
+
+            new_det_gpu_ids = self._assign_new_det_to_gpus(
+                new_det_num=1,
+                prev_workload_per_gpu=tracker_metadata["num_obj_per_gpu"],
+            )
+            obj_rank = new_det_gpu_ids[0]
+
+            if self.rank == obj_rank:
+                tracker_state = self._init_new_tracker_state(inference_state)
+                inference_state["tracker_inference_states"].append(tracker_state)
+
+            # Update metadata
+            tracker_metadata["obj_ids_per_gpu"][obj_rank] = np.concatenate([
+                tracker_metadata["obj_ids_per_gpu"][obj_rank],
+                np.array([obj_id], dtype=np.int64),
+            ])
+            tracker_metadata["num_obj_per_gpu"][obj_rank] = len(
+                tracker_metadata["obj_ids_per_gpu"][obj_rank]
+            )
+            tracker_metadata["obj_ids_all_gpu"] = np.concatenate(
+                tracker_metadata["obj_ids_per_gpu"]
+            )
+            tracker_metadata["max_obj_id"] = max(tracker_metadata["max_obj_id"], obj_id)
+
+            logger.debug(
+                f"[rank={self.rank}] Adding new object with id {obj_id} via mask at frame {frame_idx}."
+            )
+            self.add_action_history(
+                inference_state, "add", frame_idx=frame_idx, obj_ids=[obj_id]
+            )
+        else:
+            # Existing object
+            if self.rank == obj_rank:
+                tracker_states = self._get_tracker_inference_states_by_obj_ids(
+                    inference_state, [obj_id]
+                )
+                assert (
+                    len(tracker_states) == 1
+                ), f"[rank={self.rank}] Multiple Tracker inference states found for obj_id {obj_id}."
+                tracker_state = tracker_states[0]
+
+            logger.debug(
+                f"[rank={self.rank}] Adding mask for existing object with id {obj_id} at frame {frame_idx}."
+            )
+            self.add_action_history(
+                inference_state, "refine", frame_idx=frame_idx, obj_ids=[obj_id]
+            )
+
+        # Assign high score to the object
+        tracker_metadata["obj_id_to_score"][obj_id] = 1.0
+        tracker_metadata["obj_id_to_tracker_score_frame_wise"][frame_idx][obj_id] = 1.0
+
+        # Clear removed/suppressed status (same pattern as add_tracker_new_points)
+        if self.rank == 0:
+            rank0_metadata = tracker_metadata.get("rank0_metadata", {})
+            if "removed_obj_ids" in rank0_metadata:
+                rank0_metadata["removed_obj_ids"].discard(obj_id)
+            if "suppressed_obj_ids" in rank0_metadata:
+                for frame_id in rank0_metadata["suppressed_obj_ids"]:
+                    rank0_metadata["suppressed_obj_ids"][frame_id].discard(obj_id)
+
+        obj_ids = []
+        video_res_masks = None
+        if self.rank == obj_rank:
+            # Prepare backbone features (required by _run_single_frame_inference inside add_new_mask)
+            self._prepare_backbone_feats(inference_state, frame_idx, reverse=False)
+
+            # Call the tracker's add_new_mask with the TRACKER-level state
+            frame_idx, obj_ids, low_res_masks, video_res_masks = (
+                self.tracker.add_new_mask(
+                    inference_state=tracker_state,
+                    frame_idx=frame_idx,
+                    obj_id=obj_id,
+                    mask=mask,
+                )
+            )
+
+            # Run mem encoder preflight (same as add_tracker_new_points)
+            self.tracker.propagate_in_video_preflight(
+                tracker_state, run_mem_encoder=True
+            )
+
+        # Cache the mask output for this frame
+        if self.rank == obj_rank and obj_ids and video_res_masks is not None:
+            new_mask_data = (video_res_masks[obj_ids.index(obj_id)] > 0.0).to(torch.bool)
+        else:
+            new_mask_data = None
+
+        if self.world_size > 1:
+            data_list = [new_mask_data.cpu() if new_mask_data is not None else None]
+            self.broadcast_python_obj_cpu(data_list, src=obj_rank)
+            new_mask_data = data_list[0].to(self.device)
+
+        if self.rank == 0:
+            if "cached_frame_outputs" not in inference_state:
+                inference_state["cached_frame_outputs"] = {}
+            if frame_idx not in inference_state["cached_frame_outputs"]:
+                inference_state["cached_frame_outputs"][frame_idx] = {}
+            if new_mask_data is not None:
+                inference_state["cached_frame_outputs"][frame_idx][obj_id] = new_mask_data
+
+        outputs = {
+            "obj_ids": obj_ids,
+            "video_res_masks": video_res_masks,
+        }
+        return frame_idx, outputs
+
+    @torch.inference_mode()
     def add_tracker_new_points(
         self,
         inference_state,

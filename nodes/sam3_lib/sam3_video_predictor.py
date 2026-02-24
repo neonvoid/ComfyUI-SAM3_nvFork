@@ -237,8 +237,10 @@ class Sam3VideoPredictor:
             mask_tensor = mask_tensor.squeeze()
         assert mask_tensor.dim() == 2, f"Mask must be 2D, got {mask_tensor.dim()}D"
 
-        # Call the model's add_new_mask method
-        frame_idx, obj_ids, low_res_masks, video_res_masks = self.model.add_new_mask(
+        # Call the tracker's add_new_mask method
+        # Note: add_new_mask lives on the tracker (Sam3TrackingPredictor), not
+        # on the model (Sam3VideoInferenceWithInstanceInteractivity) directly.
+        frame_idx, obj_ids, low_res_masks, video_res_masks = self.model.tracker.add_new_mask(
             inference_state=inference_state,
             frame_idx=frame_idx,
             obj_id=obj_id,

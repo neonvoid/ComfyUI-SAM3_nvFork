@@ -2926,6 +2926,453 @@ class SAM3MaskToVideo:
 
 
 # =============================================================================
+# Mask Refinement
+# =============================================================================
+
+class SAM3MaskRefine:
+    """
+    Refine existing masks by feeding them back into SAM3 as conditioning.
+
+    Takes masks from a first-pass SAM3 run (or any ComfyUI mask sequence) and
+    uses them as mask prompts at regular keyframe intervals. SAM3 then re-tracks
+    using these masks as initialization, producing refined masks that can be
+    merged with the originals.
+
+    Typical workflow:
+        SAM3VideoSegmentation -> SAM3Propagate -> SAM3VideoOutput -> SAM3MaskRefine
+        (first pass tracking)                     (extract masks)   (refine pass)
+    """
+    _cache = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sam3_model": ("SAM3_MODEL", {
+                    "tooltip": "SAM3 model (from LoadSAM3Model)"
+                }),
+                "video_frames": ("IMAGE", {
+                    "tooltip": "Original video frames [N, H, W, C]"
+                }),
+                "input_masks": ("MASK", {
+                    "tooltip": "Existing mask sequence [N, H, W] from first pass"
+                }),
+            },
+            "optional": {
+                "keyframe_interval": ("INT", {
+                    "default": 10,
+                    "min": 1,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": "Use mask from every Nth frame as conditioning. Lower = more constraints (closer to original). Higher = more freedom to refine."
+                }),
+                "merge_mode": (["union", "replace", "intersect"], {
+                    "default": "union",
+                    "tooltip": "How to merge refined masks with originals: union (adds regions), replace (use refined only), intersect (conservative refinement)"
+                }),
+                "positive_points": ("SAM3_POINTS_PROMPT", {
+                    "tooltip": "Additional corrective points to add on frame_idx"
+                }),
+                "negative_points": ("SAM3_POINTS_PROMPT", {
+                    "tooltip": "Negative corrective points to add on frame_idx"
+                }),
+                "positive_boxes": ("SAM3_BOXES_PROMPT", {
+                    "tooltip": "Additional corrective boxes to add on frame_idx"
+                }),
+                "negative_boxes": ("SAM3_BOXES_PROMPT", {
+                    "tooltip": "Negative corrective boxes to add on frame_idx"
+                }),
+                "frame_idx": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "tooltip": "Frame to apply optional point/box prompts"
+                }),
+                "obj_id": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "tooltip": "Object ID for mask prompts (use 1 for single-object workflows)"
+                }),
+                "offload_video_to_cpu": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Store video frames on CPU (minor overhead, saves VRAM)"
+                }),
+                "offload_state_to_cpu": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Store inference state on CPU (slower, saves more VRAM)"
+                }),
+                "offload_model": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Move model to CPU after refinement to free VRAM"
+                }),
+            }
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, sam3_model, video_frames, input_masks,
+                   keyframe_interval=10, merge_mode="union",
+                   positive_points=None, negative_points=None,
+                   positive_boxes=None, negative_boxes=None,
+                   frame_idx=0, obj_id=1,
+                   offload_video_to_cpu=True, offload_state_to_cpu=False,
+                   offload_model=False):
+        if video_frames is None or input_masks is None:
+            return float("NaN")
+        return (id(video_frames), id(input_masks), keyframe_interval, merge_mode,
+                str(positive_points), str(negative_points),
+                str(positive_boxes), str(negative_boxes),
+                frame_idx, obj_id, offload_video_to_cpu, offload_state_to_cpu)
+
+    RETURN_TYPES = ("MASK", "IMAGE")
+    RETURN_NAMES = ("masks", "visualization")
+    FUNCTION = "refine"
+    CATEGORY = "SAM3/video"
+
+    def _create_visualization(self, video_frames, masks_tensor):
+        """Create colored overlay visualization of refined masks on source frames."""
+        from .utils import DEFAULT_COLORS
+
+        vis_list = []
+        color = torch.tensor(DEFAULT_COLORS[0], dtype=torch.float32)  # Blue
+
+        for fi in range(masks_tensor.shape[0]):
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            frame = video_frames[fi]  # [H, W, C]
+            mask = masks_tensor[fi].float()  # [H, W]
+
+            mask_rgb = mask.unsqueeze(-1) * color.view(1, 1, 3)
+            vis_frame = frame * (1 - 0.5 * mask.unsqueeze(-1)) + 0.5 * mask_rgb
+            vis_list.append(vis_frame.clamp(0, 1))
+
+        return torch.stack(vis_list, dim=0)
+
+    def refine(self, sam3_model, video_frames, input_masks,
+               keyframe_interval=10, merge_mode="union",
+               positive_points=None, negative_points=None,
+               positive_boxes=None, negative_boxes=None,
+               frame_idx=0, obj_id=1,
+               offload_video_to_cpu=True, offload_state_to_cpu=False,
+               offload_model=False):
+        """Refine masks by feeding keyframes back into SAM3."""
+        # Defaults for older workflows
+        keyframe_interval = keyframe_interval if keyframe_interval is not None else 10
+        merge_mode = merge_mode if merge_mode is not None else "union"
+        obj_id = obj_id if obj_id is not None else 1
+
+        # --- Cache check ---
+        cache_key = (id(video_frames), id(input_masks), keyframe_interval, merge_mode,
+                     str(positive_points), str(negative_points),
+                     str(positive_boxes), str(negative_boxes),
+                     frame_idx, obj_id, offload_video_to_cpu, offload_state_to_cpu)
+
+        if cache_key in SAM3MaskRefine._cache:
+            print(f"[SAM3 MaskRefine] CACHE HIT")
+            if offload_model:
+                if hasattr(sam3_model, 'model'):
+                    sam3_model.model.cpu()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            return SAM3MaskRefine._cache[cache_key]
+
+        print(f"[SAM3 MaskRefine] CACHE MISS - running refinement")
+        print_vram("Before mask refine")
+
+        num_video_frames = video_frames.shape[0]
+        num_mask_frames = input_masks.shape[0]
+        h, w = video_frames.shape[1], video_frames.shape[2]
+
+        # Handle frame count mismatch
+        num_frames = min(num_video_frames, num_mask_frames)
+        if num_video_frames != num_mask_frames:
+            print(f"[SAM3 MaskRefine] Warning: video has {num_video_frames} frames, "
+                  f"masks have {num_mask_frames} frames. Using first {num_frames}.")
+
+        working_frames = video_frames[:num_frames]
+
+        # --- Step 1: Create video state ---
+        config = VideoConfig(
+            offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
+        )
+        video_state = create_video_state(
+            video_frames=working_frames,
+            config=config,
+        )
+        print(f"[SAM3 MaskRefine] Session {video_state.session_uuid[:8]}: "
+              f"{num_frames} frames, {w}x{h}")
+
+        # --- Step 2: Add mask prompts at keyframe intervals ---
+        # Determine which frames have corrective prompts so we skip those.
+        # SAM3 internally treats point and mask prompts as mutually exclusive
+        # on the same (frame_idx, obj_id) — the last one applied erases the
+        # other (add_new_mask clears points, add_new_points clears masks).
+        # So if the user provides corrective clicks on a frame, we let the
+        # clicks take priority and skip the mask keyframe there.
+        has_corrective = (
+            (positive_points and (positive_points.get("objects") or positive_points.get("points")))
+            or (positive_boxes and positive_boxes.get("boxes"))
+            or (negative_boxes and negative_boxes.get("boxes"))
+        )
+        corrective_frame = frame_idx if has_corrective else -1
+
+        keyframes_added = 0
+        num_keyframes = len(range(0, num_frames, keyframe_interval))
+        mask_pixels = h * w
+
+        # Warn about memory if many large masks will be stored as flattened tuples
+        estimated_mb = num_keyframes * mask_pixels * 4 / (1024 * 1024)  # 4 bytes per float
+        if estimated_mb > 500:
+            print(f"[SAM3 MaskRefine] Warning: storing {num_keyframes} mask keyframes "
+                  f"at {w}x{h} will use ~{estimated_mb:.0f}MB RAM in video state. "
+                  f"Consider increasing keyframe_interval to reduce memory usage.")
+
+        for kf_idx in range(0, num_frames, keyframe_interval):
+            # Skip keyframe if corrective prompts target this frame
+            if kf_idx == corrective_frame:
+                print(f"[SAM3 MaskRefine] Skipping mask keyframe {kf_idx} "
+                      f"(corrective prompts take priority on this frame)")
+                continue
+
+            frame_mask = input_masks[kf_idx].float()
+
+            # Normalize to 0-1
+            if frame_mask.max() > 1.0:
+                frame_mask = frame_mask / 255.0
+
+            # Skip empty masks
+            if frame_mask.sum() < 100:
+                print(f"[SAM3 MaskRefine] Skipping empty keyframe {kf_idx}")
+                continue
+
+            # Resize if needed
+            mask_h, mask_w = frame_mask.shape[-2], frame_mask.shape[-1]
+            if mask_h != h or mask_w != w:
+                frame_mask = torch.nn.functional.interpolate(
+                    frame_mask.unsqueeze(0).unsqueeze(0),
+                    size=(h, w),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
+
+            prompt = VideoPrompt.create_mask(
+                frame_idx=kf_idx,
+                obj_id=obj_id,
+                mask=frame_mask,
+            )
+            video_state = video_state.with_prompt(prompt)
+            keyframes_added += 1
+
+        print(f"[SAM3 MaskRefine] Added {keyframes_added} mask keyframes "
+              f"(interval={keyframe_interval})")
+
+        # --- Step 3: Add optional corrective prompts ---
+        prompts_added = 0
+
+        if positive_points:
+            if positive_points.get("objects"):
+                # Multi-object format
+                for obj_data in positive_points["objects"]:
+                    current_obj_id = obj_data.get("obj_id", obj_id)
+                    pos_pts = obj_data.get("positive_points", [])
+                    neg_pts = obj_data.get("negative_points", [])
+                    all_points = []
+                    all_labels = []
+                    for pt in pos_pts:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(1)
+                    for pt in neg_pts:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(0)
+                    if all_points:
+                        prompt = VideoPrompt.create_point(frame_idx, current_obj_id, all_points, all_labels)
+                        video_state = video_state.with_prompt(prompt)
+                        prompts_added += 1
+            elif positive_points.get("points"):
+                # Legacy single-object format
+                all_points = []
+                all_labels = []
+                for pt in positive_points["points"]:
+                    all_points.append([float(pt[0]), float(pt[1])])
+                    all_labels.append(1)
+                if negative_points and negative_points.get("points"):
+                    for pt in negative_points["points"]:
+                        all_points.append([float(pt[0]), float(pt[1])])
+                        all_labels.append(0)
+                if all_points:
+                    prompt = VideoPrompt.create_point(frame_idx, obj_id, all_points, all_labels)
+                    video_state = video_state.with_prompt(prompt)
+                    prompts_added += 1
+
+        if positive_boxes and positive_boxes.get("boxes"):
+            for box_data in positive_boxes["boxes"]:
+                cx, cy, bw, bh = box_data
+                x1, y1 = cx - bw / 2, cy - bh / 2
+                x2, y2 = cx + bw / 2, cy + bh / 2
+                prompt = VideoPrompt.create_box(frame_idx, obj_id, [x1, y1, x2, y2], is_positive=True)
+                video_state = video_state.with_prompt(prompt)
+                prompts_added += 1
+
+        if negative_boxes and negative_boxes.get("boxes"):
+            for box_data in negative_boxes["boxes"]:
+                cx, cy, bw, bh = box_data
+                x1, y1 = cx - bw / 2, cy - bh / 2
+                x2, y2 = cx + bw / 2, cy + bh / 2
+                prompt = VideoPrompt.create_box(frame_idx, obj_id, [x1, y1, x2, y2], is_positive=False)
+                video_state = video_state.with_prompt(prompt)
+                prompts_added += 1
+
+        if prompts_added > 0:
+            print(f"[SAM3 MaskRefine] Added {prompts_added} corrective prompts on frame {frame_idx}")
+
+        # Validate at least one prompt
+        if len(video_state.prompts) == 0:
+            raise ValueError("[SAM3 MaskRefine] No valid prompts. Input masks may be all empty.")
+
+        # --- Step 4: Ensure model on GPU ---
+        if hasattr(sam3_model, 'model') and hasattr(sam3_model.model, 'to'):
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            sam3_model.model.to(device)
+
+        # --- Step 5: Propagate ---
+        request = {
+            "type": "propagate_in_video",
+            "session_id": video_state.session_uuid,
+            "propagation_direction": "forward",
+            "start_frame_index": 0,
+            "max_frame_num_to_track": num_frames,
+        }
+
+        refined_masks = {}
+        autocast_context = _get_autocast_context()
+
+        with autocast_context:
+            print_vram("Before reconstruction")
+            inference_state = get_inference_state(sam3_model, video_state)
+            print_vram("After reconstruction")
+
+            try:
+                for response in sam3_model.handle_stream_request(request):
+                    comfy.model_management.throw_exception_if_processing_interrupted()
+
+                    frame_index = response.get("frame_index", response.get("frame_idx"))
+                    if frame_index is None:
+                        continue
+
+                    outputs = response.get("outputs", response)
+                    if outputs is None:
+                        continue
+
+                    # Extract mask (same key search pattern as SAM3Propagate)
+                    mask = None
+                    mask_key = None
+                    for key in ["out_binary_masks", "video_res_masks", "masks"]:
+                        if key in outputs and outputs[key] is not None:
+                            mask_key = key
+                            mask = outputs[key]
+                            break
+
+                    if mask is not None:
+                        if hasattr(mask, 'cpu'):
+                            mask = mask.cpu()
+                        refined_masks[frame_index] = mask
+                        del outputs[mask_key]
+
+                    outputs.clear()
+
+                    if frame_index % 16 == 0:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+            except Exception as e:
+                print(f"[SAM3 MaskRefine] Propagation error: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+
+        print_vram("After propagation")
+        print(f"[SAM3 MaskRefine] Propagation complete: {len(refined_masks)} frames")
+
+        # --- Step 6: Merge refined masks with originals ---
+        merged_list = []
+        for fi in range(num_frames):
+            original_mask = input_masks[fi].float().cpu()
+
+            if original_mask.max() > 1.0:
+                original_mask = original_mask / 255.0
+
+            if fi in refined_masks:
+                raw_refined = refined_masks[fi]
+
+                # Convert to combined 2D mask [H, W]
+                if isinstance(raw_refined, np.ndarray):
+                    raw_refined = torch.from_numpy(raw_refined)
+                if raw_refined.dim() == 4:
+                    raw_refined = raw_refined.squeeze(0)
+                if raw_refined.dim() == 3:
+                    # Multi-object [num_obj, H, W] -> combine via max
+                    raw_refined = raw_refined.max(dim=0)[0]
+                raw_refined = raw_refined.float().cpu()
+                if raw_refined.max() > 1.0:
+                    raw_refined = raw_refined / 255.0
+
+                # Resize if dimensions don't match
+                rh, rw = raw_refined.shape[-2], raw_refined.shape[-1]
+                oh, ow = original_mask.shape[-2], original_mask.shape[-1]
+                if rh != oh or rw != ow:
+                    raw_refined = torch.nn.functional.interpolate(
+                        raw_refined.unsqueeze(0).unsqueeze(0),
+                        size=(oh, ow),
+                        mode='bilinear',
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0)
+
+                # Apply merge mode
+                if merge_mode == "union":
+                    merged = torch.max(original_mask, raw_refined)
+                elif merge_mode == "replace":
+                    merged = raw_refined
+                elif merge_mode == "intersect":
+                    merged = torch.min(original_mask, raw_refined)
+                else:
+                    merged = torch.max(original_mask, raw_refined)
+            else:
+                # No refined mask for this frame - keep original
+                merged = original_mask
+
+            merged_list.append(merged)
+
+        all_masks = torch.stack(merged_list, dim=0)
+
+        # --- Step 7: Visualization ---
+        visualization = self._create_visualization(working_frames.cpu(), all_masks)
+
+        # --- Step 8: Cleanup ---
+        refined_masks.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if offload_model:
+            print("[SAM3 MaskRefine] Offloading model to CPU...")
+            if hasattr(sam3_model, 'model'):
+                sam3_model.model.cpu()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print_vram("After model offload")
+
+        # Cache result
+        result = (all_masks, visualization)
+        SAM3MaskRefine._cache[cache_key] = result
+
+        print(f"[SAM3 MaskRefine] Done. Output: {all_masks.shape}")
+        print_vram("After mask refine complete")
+
+        return result
+
+
+# =============================================================================
 # Node Mappings
 # =============================================================================
 
@@ -2938,6 +3385,7 @@ NODE_CLASS_MAPPINGS = {
     "SAM3VRAMEstimator": SAM3VRAMEstimator,
     "SAM3MaskLoader": SAM3MaskLoader,
     "SAM3MaskToVideo": SAM3MaskToVideo,
+    "SAM3MaskRefine": SAM3MaskRefine,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2949,4 +3397,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3VRAMEstimator": "SAM3 VRAM Estimator",
     "SAM3MaskLoader": "SAM3 Mask Loader",
     "SAM3MaskToVideo": "SAM3 Mask to Video",
+    "SAM3MaskRefine": "SAM3 Mask Refine",
 }

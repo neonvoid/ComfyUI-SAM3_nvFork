@@ -91,6 +91,8 @@ NV SAM3 Auto Cleanup
 - Fixed color instability when objects leave/enter frame
 - Fixed device mismatches when using CPU offloading
 - Fixed NMS OOM on scenes with many detection candidates
+- Fixed point+box prompt merging — points and boxes on the same object are now combined into a single API call (previously `clear_old_points=True` caused the box call to erase click points)
+- Fixed bbox coordinate conversion in SAM3 Add Prompt (was passing center-format `[cx,cy,w,h]` raw instead of converting to corner-format `[x1,y1,x2,y2]`)
 
 **New nodes:**
 - Per-object mask extraction with metadata (NV SAM3 Mask Tracks)
@@ -104,6 +106,22 @@ NV SAM3 Auto Cleanup
 - Immutable video state (no global mutable state between nodes)
 - ComfyUI model management integration (ModelPatcher, load_models_gpu)
 - Interrupt handling in all long-running loops
+
+## Tips
+
+### Combining points and boxes
+
+You can plug both a **SAM3 Point Collector** and a **SAM3 BBox Collector** into the same **SAM3 Video Segmentation** (or **SAM3 Add Prompt**) node. The bbox acts as a region constraint while click points provide precise foreground/background guidance within that region. Internally, box corners are encoded as special point labels (`2`=top-left, `3`=bottom-right) and merged with your click points into a single prompt — matching how SAM2/SAM3 was trained.
+
+### Multi-frame corrections
+
+Chain **SAM3 Add Prompt** nodes after **SAM3 Video Segmentation** to add correction anchors on later frames where tracking drifts (occlusions, fast motion, re-entry):
+```
+SAM3 Video Segmentation (frame 0)
+     → SAM3 Add Prompt (frame 100)
+     → SAM3 Add Prompt (frame 200)
+     → SAM3 Propagate
+```
 
 ## Troubleshooting
 

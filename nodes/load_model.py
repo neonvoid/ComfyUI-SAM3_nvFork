@@ -230,6 +230,11 @@ class LoadSAM3Model:
 
         print(f"[SAM3] Load device: {load_device}, Offload device: {offload_device}")
 
+        # Resolve HF token: node input > env var > huggingface-cli cached token (None)
+        effective_token = hf_token.strip() if hf_token and hf_token.strip() else None
+        if not effective_token:
+            effective_token = os.environ.get("HF_TOKEN", "").strip() or None
+
         # Resolve checkpoint path
         checkpoint_path = Path(model_path)
         if not checkpoint_path.is_absolute():
@@ -238,14 +243,8 @@ class LoadSAM3Model:
 
         # Check if model exists, download if needed
         if not checkpoint_path.exists():
-            if hf_token and hf_token.strip():
-                print(f"[SAM3] Model not found at {checkpoint_path}, downloading...")
-                self._download_from_huggingface(hf_token, checkpoint_path)
-            else:
-                raise FileNotFoundError(
-                    f"[SAM3] Model file not found: {checkpoint_path}\n"
-                    f"Either place the model at this path, or provide an hf_token to download it."
-                )
+            print(f"[SAM3] Model not found at {checkpoint_path}, downloading...")
+            self._download_from_huggingface(effective_token, checkpoint_path)
 
         checkpoint_path_str = str(checkpoint_path)
 
@@ -259,14 +258,14 @@ class LoadSAM3Model:
         # Build video predictor (contains both image and video capabilities)
         print(f"[SAM3] Building SAM3 unified model...")
         try:
-            # Set HF token if provided (for potential downloads)
-            if hf_token:
-                os.environ["HF_TOKEN"] = hf_token
+            # Set HF token if resolved (for potential downloads)
+            if effective_token:
+                os.environ["HF_TOKEN"] = effective_token
 
             video_predictor = Sam3VideoPredictor(
                 checkpoint_path=checkpoint_path_str,
                 bpe_path=bpe_path_str,
-                hf_token=hf_token if hf_token else None,
+                hf_token=effective_token,
                 enable_inst_interactivity=enable_inst_interactivity,
             )
         except FileNotFoundError as e:
@@ -336,18 +335,15 @@ class LoadSAM3Model:
             SAM3_MODEL_ID = "facebook/sam3.1"
             SAM3_CKPT_NAME = "sam3.1_multiplex.pt"
 
-            hf_hub_download(
+            # Download to HF cache, then copy to target path
+            cached_path = hf_hub_download(
                 repo_id=SAM3_MODEL_ID,
                 filename=SAM3_CKPT_NAME,
-                token=hf_token.strip(),
-                local_dir=str(target_path.parent),
-                local_dir_use_symlinks=False
+                token=hf_token.strip() if hf_token else None,
             )
 
-            # hf_hub_download saves as filename, rename if needed
-            downloaded_file = target_path.parent / SAM3_CKPT_NAME
-            if downloaded_file != target_path and downloaded_file.exists():
-                downloaded_file.rename(target_path)
+            import shutil
+            shutil.copy2(cached_path, str(target_path))
 
             print(f"[SAM3] Model downloaded successfully to: {target_path}")
 

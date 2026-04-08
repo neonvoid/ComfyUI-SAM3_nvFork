@@ -660,8 +660,8 @@ def download_ckpt_from_hf(hf_token=None):
     Returns:
         Path to downloaded checkpoint
     """
-    SAM3_MODEL_ID = "facebook/sam3"
-    SAM3_CKPT_NAME = "sam3.pt"
+    SAM3_MODEL_ID = "facebook/sam3.1"
+    SAM3_CKPT_NAME = "sam3.1_multiplex.pt"
     SAM3_CFG_NAME = "config.json"
 
     # Download config and checkpoint with authentication if token provided

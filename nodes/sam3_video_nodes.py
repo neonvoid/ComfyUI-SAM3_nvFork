@@ -263,16 +263,17 @@ class SAM3VideoSegmentation:
     """
     Initialize video tracking and add prompts.
 
-    Select prompt_mode to choose between:
-    - text: Track objects by text description (comma-separated for multiple)
-    - point: Track objects by clicking points (positive/negative)
+    Prompt mode is inferred from what you provide:
+    - text_prompt non-empty → track objects by text description
+    - positive/negative points connected → track objects by points
+    - positive/negative boxes connected → track objects by boxes (combinable
+      with text OR points as region hints)
 
-    Box inputs (positive/negative) can be combined with either mode as region hints.
+    Text and points are mutually exclusive — providing both raises an error.
+    Boxes can combine with either as region hints.
     """
     # Class-level cache for video state results
     _cache = {}
-
-    PROMPT_MODES = ["text", "point"]
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -281,31 +282,24 @@ class SAM3VideoSegmentation:
                 "video_frames": ("IMAGE", {
                     "tooltip": "Video frames as batch of images [N, H, W, C]"
                 }),
-                "prompt_mode": (cls.PROMPT_MODES, {
-                    "default": "text",
-                    "tooltip": "Prompt type: text (describe objects) or point (click on objects). Box inputs can be combined with either mode."
-                }),
             },
             "optional": {
-                # Text mode inputs
                 "text_prompt": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "tooltip": "[text mode] Text description(s) to track. Comma-separated for multiple objects (e.g., 'person, dog, car')"
+                    "tooltip": "Text description(s) to track. Comma-separated for multiple objects (e.g., 'person, dog, car'). Mutually exclusive with points."
                 }),
-                # Point mode inputs
                 "positive_points": ("SAM3_POINTS_PROMPT", {
-                    "tooltip": "[point mode] Positive points - click on objects to track"
+                    "tooltip": "Positive points — click on objects to track. Mutually exclusive with text_prompt."
                 }),
                 "negative_points": ("SAM3_POINTS_PROMPT", {
-                    "tooltip": "[point mode] Negative points - click on areas to exclude"
+                    "tooltip": "Negative points — click on areas to exclude. Mutually exclusive with text_prompt."
                 }),
-                # Box mode inputs
                 "positive_boxes": ("SAM3_BOXES_PROMPT", {
-                    "tooltip": "[box mode] Positive boxes - draw around objects to track"
+                    "tooltip": "Positive boxes — region hints, combinable with text or points."
                 }),
                 "negative_boxes": ("SAM3_BOXES_PROMPT", {
-                    "tooltip": "[box mode] Negative boxes - draw around areas to exclude"
+                    "tooltip": "Negative boxes — region hints, combinable with text or points."
                 }),
                 # Common inputs
                 "frame_idx": ("INT", {
@@ -370,7 +364,7 @@ class SAM3VideoSegmentation:
         }
 
     @classmethod
-    def IS_CHANGED(cls, video_frames, prompt_mode="text", text_prompt="",
+    def IS_CHANGED(cls, video_frames, text_prompt="",
                    positive_points=None, negative_points=None,
                    positive_boxes=None, negative_boxes=None,
                    frame_idx=0, score_threshold=0.3,
@@ -401,7 +395,6 @@ class SAM3VideoSegmentation:
 
         return hash((
             video_hash,
-            prompt_mode,
             text_prompt,
             str(positive_points),
             str(negative_points),
@@ -423,14 +416,44 @@ class SAM3VideoSegmentation:
     FUNCTION = "segment"
     CATEGORY = "SAM3/video"
 
-    def segment(self, video_frames, prompt_mode="text", text_prompt="",
+    def segment(self, video_frames, text_prompt="",
                 positive_points=None, negative_points=None,
                 positive_boxes=None, negative_boxes=None,
                 frame_idx=0, score_threshold=0.3,
                 offload_video_to_cpu=True, offload_state_to_cpu=False,
                 hotstart_delay=15, hotstart_unmatch_thresh=8, hotstart_dup_thresh=8,
                 new_det_thresh=0.4, assoc_iou_thresh=0.1):
-        """Initialize video state and add prompts based on selected mode."""
+        """Initialize video state and add prompts based on what the user provided.
+
+        Mode inference:
+          - text_prompt non-empty       → text mode
+          - positive/negative points    → point mode
+          - positive/negative boxes     → always processed as region hints
+        Text and points are mutually exclusive — raises ValueError if both given.
+        """
+        # Auto-detect which prompts are actually present
+        has_text = bool(text_prompt and text_prompt.strip())
+        has_points = bool(
+            (positive_points and (positive_points.get("points") or positive_points.get("objects")))
+            or (negative_points and negative_points.get("points"))
+        )
+        has_boxes = bool(
+            (positive_boxes and positive_boxes.get("boxes"))
+            or (negative_boxes and negative_boxes.get("boxes"))
+        )
+
+        if has_text and has_points:
+            raise ValueError(
+                "[SAM3 Video] Both text_prompt and points provided — these are "
+                "mutually exclusive. Provide ONE of: text_prompt, or points "
+                "(boxes can combine with either)."
+            )
+        if not (has_text or has_points or has_boxes):
+            raise ValueError(
+                "[SAM3 Video] No prompts provided — enter text_prompt, or "
+                "connect positive/negative points or boxes."
+            )
+
         # Create cache key from inputs
         import hashlib
         h = hashlib.md5()
@@ -442,7 +465,6 @@ class SAM3VideoSegmentation:
         h.update(first_frame[-1, -1, :].tobytes())
         h.update(last_frame[0, 0, :].tobytes())
         h.update(last_frame[-1, -1, :].tobytes())
-        h.update(prompt_mode.encode())
         h.update(text_prompt.encode())
         h.update(str(id(positive_points)).encode() if positive_points else b"none")
         h.update(str(id(negative_points)).encode() if negative_points else b"none")
@@ -487,27 +509,28 @@ class SAM3VideoSegmentation:
 
         print(f"[SAM3 Video] Initialized session {video_state.session_uuid[:8]}")
         print(f"[SAM3 Video] Frames: {video_state.num_frames}, Size: {video_state.width}x{video_state.height}")
-        print(f"[SAM3 Video] Prompt mode: {prompt_mode}")
+        mode_tags = []
+        if has_text: mode_tags.append("text")
+        if has_points: mode_tags.append("points")
+        if has_boxes: mode_tags.append("boxes")
+        print(f"[SAM3 Video] Detected prompts: {' + '.join(mode_tags)}")
         print(f"[SAM3 Video] Hotstart config: delay={hotstart_delay}, unmatch_thresh={hotstart_unmatch_thresh}, dup_thresh={hotstart_dup_thresh}")
         print(f"[SAM3 Video] Detection config: new_det_thresh={new_det_thresh}, assoc_iou_thresh={assoc_iou_thresh}")
 
-        # 2. Add prompts based on mode (mutually exclusive)
+        # 2. Add prompts. Text and points are mutually exclusive (checked above);
+        #    boxes are always additive region hints.
         obj_id = 1
 
-        if prompt_mode == "text":
-            # Text mode: parse comma-separated text prompts
-            if text_prompt and text_prompt.strip():
-                for text in text_prompt.split(","):
-                    text = text.strip()
-                    if text:
-                        prompt = VideoPrompt.create_text(frame_idx, obj_id, text)
-                        video_state = video_state.with_prompt(prompt)
-                        print(f"[SAM3 Video] Added text prompt: obj={obj_id}, text='{text}'")
-                        obj_id += 1
-            else:
-                print("[SAM3 Video] Warning: text mode selected but no text_prompt provided")
+        if has_text:
+            for text in text_prompt.split(","):
+                text = text.strip()
+                if text:
+                    prompt = VideoPrompt.create_text(frame_idx, obj_id, text)
+                    video_state = video_state.with_prompt(prompt)
+                    print(f"[SAM3 Video] Added text prompt: obj={obj_id}, text='{text}'")
+                    obj_id += 1
 
-        elif prompt_mode == "point":
+        elif has_points:
             # Point mode: combine positive and negative points
             # Check for multi-object format first
             if positive_points and positive_points.get("objects"):
@@ -560,7 +583,7 @@ class SAM3VideoSegmentation:
                     print(f"[SAM3 Video] Added point prompt: obj={obj_id}, "
                           f"positive={pos_count}, negative={neg_count}")
                 else:
-                    print("[SAM3 Video] Warning: point mode selected but no points provided")
+                    print("[SAM3 Video] Warning: positive_points/negative_points connected but contained no points")
 
         # 3. Always process box inputs (can be combined with any mode)
         # Boxes act as region hints/constraints in addition to text or point prompts
@@ -594,7 +617,7 @@ class SAM3VideoSegmentation:
 
         # Validate at least one prompt was added
         if len(video_state.prompts) == 0:
-            print(f"[SAM3 Video] Warning: No prompts added for mode '{prompt_mode}'")
+            print(f"[SAM3 Video] Warning: No prompts added (inputs were detected but contained no usable data)")
 
         print(f"[SAM3 Video] Total prompts: {len(video_state.prompts)}")
         print_vram("After video segmentation")

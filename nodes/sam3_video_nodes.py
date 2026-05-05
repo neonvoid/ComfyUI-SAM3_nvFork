@@ -15,8 +15,9 @@ import gc
 import json
 import torch
 import numpy as np
+from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import folder_paths
 import comfy.model_management
@@ -33,6 +34,7 @@ from .inference_reconstructor import (
     get_inference_state,
     invalidate_session,
     clear_inference_cache,
+    register_teardown_callback,
 )
 from .sam3_model_patcher import SAM3ModelWrapper, SAM3ModelPatcher
 
@@ -80,6 +82,235 @@ def print_vram(label: str, detailed: bool = False):
             print(f"[VRAM]   Active: {stats.get('active_bytes.all.current', 0) / 1024**3:.2f}GB")
             print(f"[VRAM]   Inactive: {stats.get('inactive_split_bytes.all.current', 0) / 1024**3:.2f}GB")
             print(f"[VRAM]   Allocated retries: {stats.get('num_alloc_retries', 0)}")
+
+
+# =============================================================================
+# Bounded session cache + signature helpers
+# =============================================================================
+# Replaces the four legacy class-level `_cache = {}` dicts that previously held
+# GPU tensor refs across unrelated ComfyUI workflows. Three guarantees:
+#
+#   1. Bounded size — short cache lifetime; stale GPU tensors get released
+#      in bounded time even without explicit eviction.
+#   2. Session-scoped — when any SAM3 entrypoint sees a different session_uuid
+#      than the previous one, all four caches flush. Session is the natural
+#      ownership boundary for SAM3's C++ inference state.
+#   3. Teardown-synchronized — caches register a flush callback with
+#      inference_reconstructor; flushed BEFORE close_session() or
+#      clear_inference_cache() runs so we never hold a Python ref to a tensor
+#      whose C++ storage has been freed.
+#
+# Keys are session-scoped semantic tuples (no id() — id reuse after GC was
+# the original Mode A footgun).
+
+_SAM3_CACHE_REGISTRY = []  # list of _BoundedSessionCache instances
+_CURRENT_SESSION_UUID = {"value": None}  # mutable single-value holder
+
+
+def _short_key_repr(key, max_len=80):
+    """Compact key repr for log lines."""
+    s = repr(key)
+    if len(s) > max_len:
+        return s[:max_len] + "..."
+    return s
+
+
+class _BoundedSessionCache:
+    """Bounded LRU mapping with verbose [SAM3 Cache] logging.
+
+    Drop-in replacement for the legacy `_cache = {}` class attributes. Supports
+    `key in cache`, `cache[key]`, `cache[key] = value`, `cache.clear()`,
+    `len(cache)`. Keys must be hashable.
+
+    NOT thread-safe by design — ComfyUI executes the prompt graph on one
+    worker thread; per-cache GIL ordering matches the legacy bare dict.
+    """
+
+    def __init__(self, name: str, max_size: int = 3):
+        if max_size < 1:
+            raise ValueError(f"_BoundedSessionCache: max_size must be >= 1, got {max_size}")
+        self._name = name
+        self._max_size = max_size
+        self._store: "OrderedDict[Any, Any]" = OrderedDict()
+        _SAM3_CACHE_REGISTRY.append(self)
+
+    def __contains__(self, key) -> bool:
+        return key in self._store
+
+    def __getitem__(self, key):
+        v = self._store[key]
+        self._store.move_to_end(key)  # mark as most-recently-used
+        return v
+
+    def __setitem__(self, key, value) -> None:
+        if key in self._store:
+            self._store.move_to_end(key)
+            self._store[key] = value
+            return
+        self._store[key] = value
+        while len(self._store) > self._max_size:
+            evicted_key, _evicted_value = self._store.popitem(last=False)
+            print(f"[SAM3 Cache] {self._name} EVICT_LRU key={_short_key_repr(evicted_key)}")
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+    def get(self, key, default=None):
+        if key in self._store:
+            return self.__getitem__(key)
+        return default
+
+    def clear(self) -> None:
+        n = len(self._store)
+        self._store.clear()
+        if n > 0:
+            print(f"[SAM3 Cache] {self._name} CLEAR n={n}")
+
+
+def _flush_all_sam3_caches(reason: str) -> None:
+    """Flush every registered _BoundedSessionCache. Fired by the teardown
+    callback in inference_reconstructor BEFORE C++ inference state is freed."""
+    counts = {c._name: len(c._store) for c in _SAM3_CACHE_REGISTRY}
+    total = sum(counts.values())
+    if total == 0:
+        return
+    for c in _SAM3_CACHE_REGISTRY:
+        c._store.clear()
+    print(f"[SAM3 Cache] FLUSH_ALL reason={reason} cleared={counts}")
+
+
+# Register the flush callback. Keyed by a stable token so module reloads
+# (importlib.reload) replace the stale callback rather than accumulating one
+# per import — without the token, an old callback would pin the previous
+# module's _SAM3_CACHE_REGISTRY and any tensors still in it.
+register_teardown_callback(_flush_all_sam3_caches, name="sam3_video_nodes._flush_all_sam3_caches")
+
+
+def _maybe_evict_on_session_change(new_session_uuid: Optional[str]) -> None:
+    """If `new_session_uuid` differs from the previously-seen session UUID,
+    flush all SAM3 caches. Call at the entrypoint of any SAM3 node that
+    accepts a video_state. The session boundary is the natural ownership
+    domain for cached results."""
+    if not new_session_uuid:
+        return
+    cur = _CURRENT_SESSION_UUID["value"]
+    if cur is None:
+        _CURRENT_SESSION_UUID["value"] = new_session_uuid
+        return
+    if cur != new_session_uuid:
+        print(f"[SAM3 Cache] SESSION_CHANGE old={cur[:8]} new={new_session_uuid[:8]}")
+        _flush_all_sam3_caches("session_change")
+        _CURRENT_SESSION_UUID["value"] = new_session_uuid
+
+
+def _tensor_signature(t, n_samples: int = 256):
+    """Structural signature for an IMAGE/MASK tensor.
+
+    Returns a hashable tuple stable across reruns with identical content.
+    Three discriminators stacked for layered protection:
+
+      1. shape/dtype/device — structural fingerprint (catches resolution
+         and type changes)
+      2. mass — `t.float().sum()` over the whole tensor (catches localized
+         pixel-level edits that a strided sample alone would miss; e.g. a
+         100×100 patch on a 1024² mask has only ~1-in-400k chance of
+         landing on any of 256 strided samples)
+      3. sample_values — actual element values from a strided sample
+         (catches spatial/layout changes that preserve total mass — e.g.
+         shifting an object's position keeps sum constant but changes
+         where the values are)
+
+    Mass alone collides on letterboxing or mass-preserving permutations.
+    Samples alone miss localized edits. Combined, the false-hit risk is
+    negligible for any realistic SAM3 workflow input.
+
+    SAFETY: only call on tensors known to be live (freshly produced by the
+    current call OR provided as input by upstream nodes that just
+    completed). Reading a stale CUDA tensor here would trigger an
+    uncatchable access violation — but the teardown_callback architecture
+    ensures cached entries are flushed before their underlying storage is
+    invalidated, so the only tensors that ever reach this function are
+    live."""
+    if t is None:
+        return ("none",)
+    if not hasattr(t, "shape"):
+        return ("type", type(t).__name__)
+    shape = tuple(t.shape) if hasattr(t.shape, "__iter__") else (int(t.shape),)
+    dtype = str(t.dtype) if hasattr(t, "dtype") else "?"
+    device = str(t.device.type) if hasattr(t, "device") else "cpu"
+    try:
+        flat = t.reshape(-1)
+        n = flat.numel()
+        if n == 0:
+            return (shape, dtype, device, 0.0, ())
+        # Whole-tensor mass — catches localized edits the strided sample
+        # would miss. Use `sum(dtype=...)` to:
+        #   (a) upcast inside the reduction kernel's accumulator (no
+        #       intermediate float32 copy of the full tensor — `.float()`
+        #       on a fp16 video would silently allocate ~2× VRAM).
+        #   (b) avoid catastrophic cancellation; the +1 from a tiny pixel
+        #       edit would otherwise be absorbed and fail to flip the key.
+        # MPS (Apple Silicon) doesn't support float64; fall back to float32
+        # there. The minor cancellation risk on Mac is far better than the
+        # except branch hiding all signatures behind a single error string.
+        device_type = t.device.type if hasattr(t, "device") else "cpu"
+        acc_dtype = torch.float32 if device_type == "mps" else torch.float64
+        mass = round(float(flat.sum(dtype=acc_dtype).detach().cpu().item()), 4)
+        # Strided sample for layout discrimination. Sample is at most
+        # n_samples elements (~256) so the .float() copy here is ~1KB —
+        # no VRAM concern.
+        stride = max(1, n // n_samples)
+        sample = flat[::stride][:n_samples].detach().to("cpu", copy=True)
+        # Round per element so floating-point jitter from non-deterministic
+        # ops doesn't flip cache keys for bit-identical reruns.
+        sig_values = tuple(round(float(v), 4) for v in sample.float().tolist())
+        return (shape, dtype, device, mass, sig_values)
+    except Exception as e:
+        return (shape, dtype, device, 0.0, f"err:{type(e).__name__}")
+
+
+def _masks_signature(masks_dict, max_keys_in_sig: int = 5, n_frame_samples: int = 3):
+    """Structural signature for a SAM3 propagation masks dict.
+
+    Samples first/middle/last frames; combines tensor signatures with the
+    set of frame indices. Hashable, stable across identical reruns."""
+    if not masks_dict:
+        return ("empty",)
+    keys = sorted(masks_dict.keys())
+    n = len(keys)
+    if n == 0:
+        return ("empty",)
+    sample_idxs = [keys[0]]
+    if n >= 3:
+        sample_idxs.append(keys[n // 2])
+    if n >= 2 and keys[-1] != sample_idxs[-1]:
+        sample_idxs.append(keys[-1])
+    parts = []
+    for idx in sample_idxs:
+        v = masks_dict[idx]
+        if isinstance(v, dict):
+            t = v.get("mask")
+            obj_ids = tuple(v.get("obj_ids", ()) or ())
+        else:
+            t = v
+            obj_ids = ()
+        # 64 samples per frame — enough to distinguish mostly-empty masks
+        # from each other (8 samples could all land on zero pixels).
+        parts.append((idx, _tensor_signature(t, n_samples=64), obj_ids))
+    head_keys = tuple(keys[:max_keys_in_sig])
+    return (n, head_keys, tuple(parts))
+
+
+def _scalar_or_str(x):
+    """Hashable representation of arbitrary widget input (point/box prompt
+    dicts, etc.). NOT truncated — earlier versions truncated at 128 chars but
+    real point prompts with 7+ coordinates exceeded that budget, hiding
+    trailing edits and producing false cache hits."""
+    if x is None:
+        return None
+    if isinstance(x, (int, float, bool, str)):
+        return x
+    return repr(x)
 
 
 # =============================================================================
@@ -272,8 +503,9 @@ class SAM3VideoSegmentation:
     Text and points are mutually exclusive — providing both raises an error.
     Boxes can combine with either as region hints.
     """
-    # Class-level cache for video state results
-    _cache = {}
+    # Bounded session-scoped cache (replaces legacy `_cache = {}`).
+    # See _BoundedSessionCache docstring for crash-safety rationale.
+    _cache = _BoundedSessionCache("VideoSegmentation", max_size=3)
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -466,10 +698,12 @@ class SAM3VideoSegmentation:
         h.update(last_frame[0, 0, :].tobytes())
         h.update(last_frame[-1, -1, :].tobytes())
         h.update(text_prompt.encode())
-        h.update(str(id(positive_points)).encode() if positive_points else b"none")
-        h.update(str(id(negative_points)).encode() if negative_points else b"none")
-        h.update(str(id(positive_boxes)).encode() if positive_boxes else b"none")
-        h.update(str(id(negative_boxes)).encode() if negative_boxes else b"none")
+        # Content-derived prompt fingerprints (not id() — Python memory addresses
+        # get reused after GC, producing false cache hits on stale tensors).
+        h.update((repr(positive_points) if positive_points else "none").encode())
+        h.update((repr(negative_points) if negative_points else "none").encode())
+        h.update((repr(positive_boxes) if positive_boxes else "none").encode())
+        h.update((repr(negative_boxes) if negative_boxes else "none").encode())
         h.update(str(frame_idx).encode())
         h.update(str(score_threshold).encode())
         h.update(str(offload_video_to_cpu).encode())
@@ -814,8 +1048,10 @@ class SAM3Propagate:
 
     Reconstructs inference state on-demand from immutable video state.
     """
-    # Class-level cache for propagation results
-    _cache = {}
+    # Bounded session-scoped cache (replaces legacy `_cache = {}`).
+    # max_size=2: propagation results carry the heaviest payload (per-frame
+    # GPU mask tensors), so keep the LRU tight to bound stale-tensor exposure.
+    _cache = _BoundedSessionCache("Propagate", max_size=2)
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1594,8 +1830,24 @@ class SAM3Propagate:
         end_frame = end_frame if end_frame is not None else -1
         backward_stop_frame = backward_stop_frame if backward_stop_frame is not None else -1
 
-        # Create cache key using video_state object id (since it's immutable and cached upstream)
-        cache_key = (id(video_state), start_frame, end_frame, backward_stop_frame, direction, enable_chunking, chunk_size, range_detection_only, stream_to_disk, mask_output_path, auto_exit_on_empty, exit_delay_seconds, video_fps, lock_initial_objects)
+        # Session-scoped semantic cache key (no id() — see _BoundedSessionCache).
+        # video_state is a frozen dataclass; session_uuid + prompt count + a
+        # repr() of the prompt tuple uniquely identifies the upstream
+        # segmentation result. We use repr() instead of hash() because prompts
+        # deserialized from workflow JSON (via SAM3VideoState.from_dict) may
+        # contain nested lists, which would crash hash() with TypeError:
+        # unhashable type: 'list'.
+        _maybe_evict_on_session_change(video_state.session_uuid)
+        cache_key = (
+            "propagate",
+            video_state.session_uuid,
+            len(video_state.prompts),
+            repr(video_state.prompts),
+            start_frame, end_frame, backward_stop_frame,
+            direction, enable_chunking, chunk_size, range_detection_only,
+            stream_to_disk, mask_output_path, auto_exit_on_empty,
+            exit_delay_seconds, video_fps, lock_initial_objects,
+        )
 
         # Check if we have cached result
         if cache_key in SAM3Propagate._cache:
@@ -1962,8 +2214,8 @@ class SAM3VideoOutput:
 
     For per-object mask selection, use SAM3MaskTracks instead.
     """
-    # Class-level cache for extraction results
-    _cache = {}
+    # Bounded session-scoped cache (replaces legacy `_cache = {}`).
+    _cache = _BoundedSessionCache("VideoOutput", max_size=3)
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2075,8 +2327,30 @@ class SAM3VideoOutput:
         import os
         from .utils import get_color_palette, DEFAULT_COLORS
 
-        # Create cache key
-        cache_key = (id(masks), video_state.session_uuid, id(scores), id(obj_ids), obj_id, plot_all_masks, draw_legend, mask_colors, id(previous_visualization))
+        # Session-scoped semantic cache key (no id() — see _BoundedSessionCache).
+        # masks/scores/obj_ids come from upstream SAM3Propagate; their structural
+        # signatures discriminate different propagation results without using
+        # volatile Python memory addresses. Reading these signatures is safe here
+        # because the inputs were just produced by the upstream node call (live).
+        # NOTE 1: do NOT slice obj_ids — truncating at N entries means edits to
+        # objects past index N silently false-hit the cache.
+        # NOTE 2: include repr(video_state.prompts) explicitly. _masks_signature
+        # only samples 3 frames (start/middle/end); a prompt edit affecting only
+        # middle frames could leave those 3 sampled signatures unchanged →
+        # false hit. Threading the prompt repr through forces invalidation on
+        # any prompt change regardless of which frames it affects.
+        _maybe_evict_on_session_change(video_state.session_uuid)
+        cache_key = (
+            "videoOutput",
+            video_state.session_uuid,
+            len(video_state.prompts),
+            repr(video_state.prompts),
+            _masks_signature(masks),
+            _masks_signature(scores) if scores else None,
+            tuple(sorted(obj_ids.keys())) if obj_ids else None,
+            obj_id, plot_all_masks, draw_legend, mask_colors,
+            _tensor_signature(previous_visualization) if previous_visualization is not None else None,
+        )
 
         # Check if we have cached result
         if cache_key in SAM3VideoOutput._cache:
@@ -2965,7 +3239,9 @@ class SAM3MaskRefine:
         SAM3VideoSegmentation -> SAM3Propagate -> SAM3VideoOutput -> SAM3MaskRefine
         (first pass tracking)                     (extract masks)   (refine pass)
     """
-    _cache = {}
+    # Bounded session-scoped cache (replaces legacy `_cache = {}`).
+    # max_size=2: refine results include full mask sequences and visualizations.
+    _cache = _BoundedSessionCache("MaskRefine", max_size=2)
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -3082,10 +3358,20 @@ class SAM3MaskRefine:
         obj_id = obj_id if obj_id is not None else 1
 
         # --- Cache check ---
-        cache_key = (id(video_frames), id(input_masks), keyframe_interval, merge_mode,
-                     str(positive_points), str(negative_points),
-                     str(positive_boxes), str(negative_boxes),
-                     frame_idx, obj_id, offload_video_to_cpu, offload_state_to_cpu)
+        # Content-derived semantic key (no id()). SAM3MaskRefine has no
+        # video_state input, so we rely on tensor signatures + the teardown
+        # callback for safety; if upstream invalidated the C++ inference state,
+        # _flush_all_sam3_caches has already cleared this cache before we get
+        # here.
+        cache_key = (
+            "maskRefine",
+            _tensor_signature(video_frames),
+            _tensor_signature(input_masks),
+            keyframe_interval, merge_mode,
+            _scalar_or_str(positive_points), _scalar_or_str(negative_points),
+            _scalar_or_str(positive_boxes), _scalar_or_str(negative_boxes),
+            frame_idx, obj_id, offload_video_to_cpu, offload_state_to_cpu,
+        )
 
         if cache_key in SAM3MaskRefine._cache:
             print(f"[SAM3 MaskRefine] CACHE HIT")

@@ -15,7 +15,7 @@ import weakref
 import gc
 import torch
 from collections import OrderedDict
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 
 from .video_state import SAM3VideoState, VideoPrompt
 
@@ -26,6 +26,69 @@ def print_vram(label: str):
         alloc = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
         print(f"[VRAM] {label}: {alloc:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+
+# =============================================================================
+# Teardown callback registry
+# =============================================================================
+# Modules holding strong refs to GPU tensors backed by SAM3 C++ inference state
+# (e.g., SAM3Propagate._cache holding masks_dict tensors) MUST register a flush
+# callback here. Callbacks fire BEFORE the C++ side tears down the inference
+# state, so Python-side caches can drop their refs while the storage is still
+# valid. Synchronizing Python eviction with C++ invalidation is what prevents
+# the "live Python tensor pointing at freed CUDA storage" access violation.
+#
+# Two trigger points:
+#   1. get_inference_state() about to call close_session() on existing sessions
+#      (session change — old C++ inference state about to be freed)
+#   2. clear_inference_cache() — explicit teardown
+#
+# Callbacks receive a single string `reason` argument for logging context.
+#
+# Registration is keyed by a stable string token (e.g. "sam3_caches"), NOT by
+# function-object identity. Identity-based dedup breaks under
+# importlib.reload(): a reloaded module produces a NEW function object that
+# the registry treats as distinct from the old one, leaving the old callback
+# pinned (along with the old module's _SAM3_CACHE_REGISTRY and its cached
+# tensor refs). Token-based registration replaces stale entries cleanly.
+
+_TEARDOWN_CALLBACKS: "OrderedDict[str, Callable[[str], None]]" = OrderedDict()
+
+
+def register_teardown_callback(cb: Callable[[str], None], name: Optional[str] = None) -> None:
+    """Register a callback to fire before SAM3 C++ inference state teardown.
+
+    Args:
+        cb: A function taking a single `reason: str` argument. Must NOT raise.
+        name: Stable identifier for the registration. If a callback with this
+            name is already registered, it is REPLACED — this is the correct
+            behavior across module reloads. Defaults to `cb.__qualname__` so
+            callers who don't care about identity get sensible behavior, but
+            module reloads should pass an explicit stable name.
+    """
+    key = name if name is not None else getattr(cb, "__qualname__", repr(cb))
+    if key in _TEARDOWN_CALLBACKS:
+        # Replace silently — typical case is module reload swapping in a
+        # fresh callback for the same logical owner.
+        pass
+    _TEARDOWN_CALLBACKS[key] = cb
+
+
+def unregister_teardown_callback(name: str) -> None:
+    """Remove a callback by its registration name. No-op if not present."""
+    _TEARDOWN_CALLBACKS.pop(name, None)
+
+
+def _fire_teardown_callbacks(reason: str) -> None:
+    """Fire all registered teardown callbacks. Called before C++ teardown.
+
+    Iterates over a snapshot of the registry so a callback that registers or
+    unregisters during teardown can't corrupt iteration."""
+    for cb in list(_TEARDOWN_CALLBACKS.values()):
+        try:
+            cb(reason)
+        except Exception as e:
+            print(f"[SAM3 Cache] Teardown callback failed: {type(e).__name__}: {e}")
 
 
 class InferenceReconstructor:
@@ -87,6 +150,11 @@ class InferenceReconstructor:
         # _ALL_INFERENCE_STATES is a class variable that persists across model reloads
         existing_sessions = list(model._ALL_INFERENCE_STATES.keys())
         if existing_sessions:
+            # Fire teardown callbacks BEFORE close_session frees C++ storage. This
+            # synchronizes Python-side caches (SAM3Propagate._cache, etc.) with
+            # SAM3 C++ inference state lifecycle so cached masks dicts don't end
+            # up holding refs to freed CUDA allocations.
+            _fire_teardown_callbacks(f"session_change_close_{len(existing_sessions)}")
             print(f"[SAM3 Video] Closing {len(existing_sessions)} old sessions to free VRAM")
             for old_session_id in existing_sessions:
                 try:
@@ -312,6 +380,10 @@ class InferenceReconstructor:
 
     def clear_all(self):
         """Clear all cached inference states."""
+        # Fire teardown callbacks BEFORE clearing — same rationale as the
+        # session-change path above: dependent Python caches must drop refs
+        # before C++ storage goes away.
+        _fire_teardown_callbacks("clear_inference_cache")
         self._cache.clear()
         gc.collect()
         if torch.cuda.is_available():

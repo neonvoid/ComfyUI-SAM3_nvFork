@@ -1,10 +1,15 @@
 """
 SAM3MultiFrameAddPrompt (D-354) — batch sibling of SAM3AddPrompt.
 
-Consumes SAM3_SEED_PROMPTS STRING JSON (produced by NV_DWPoseToSAM3Seeds in
-the NV_Comfy_Utils suite) and applies each seed as a point prompt onto the
-existing SAM3_VIDEO_STATE. Replaces N sequential SAM3AddPrompt nodes for
-DWPose-driven auto-seeding workflows.
+Consumes SAM3_SEED_PROMPTS STRING JSON and applies each seed as a point
+prompt onto the existing SAM3_VIDEO_STATE. Replaces N sequential
+SAM3AddPrompt nodes for auto-seeding workflows.
+
+Source-agnostic: accepts payloads from any producer that emits the
+sam3_seed_prompts schema. Known producers in the NV_Comfy_Utils suite:
+  - NV_DWPoseToSAM3Seeds (D-359, DWPose-driven, face + body)
+  - NV_VLMToSAM3Seeds    (D-364, Gemini-VLM-driven, face + head + hair +
+                          open-vocab)
 
 Pipeline position:
   SAM3VideoSegmentation (frame 0 init) → SAM3MultiFrameAddPrompt (batch) →
@@ -107,9 +112,15 @@ def _validate_schema_version(payload: Dict[str, Any]) -> None:
 
 
 def _validate_required_keys(payload: Dict[str, Any]) -> None:
-    """Top-level required keys (R3 narrow-validate)."""
+    """Top-level required keys (R3 narrow-validate).
+
+    Source-agnostic: only fields the consumer actually reads downstream are
+    required. Producer-specific provenance keys (e.g. dwpose_person_index
+    from NV_DWPoseToSAM3Seeds) are accepted but not required, so VLM-sourced
+    payloads from NV_VLMToSAM3Seeds (D-364) pass without emitting them.
+    """
     required = ("schema_type", "schema_version", "schema_minor_compatible_with",
-                "seeds", "accepted_frames", "dwpose_person_index")
+                "seeds", "accepted_frames")
     missing = [k for k in required if k not in payload]
     if missing:
         raise ValueError(
@@ -545,5 +556,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SAM3MultiFrameAddPrompt": "SAM3 Multi-Frame Add Prompt (DWPose seeds)",
+    "SAM3MultiFrameAddPrompt": "SAM3 Multi-Frame Add Prompt",
 }

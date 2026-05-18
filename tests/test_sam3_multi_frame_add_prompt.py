@@ -204,6 +204,64 @@ def test_missing_required_top_level_key_raises():
         _call_node(payload)
 
 
+def _make_vlm_payload(seeds=None, drop_keys=None):
+    """Build a NV_VLMToSAM3Seeds-shaped payload (D-364).
+
+    Mirrors the actual schema 1.3.0 emitted by nv_vlm_to_sam3_seeds.py: no
+    dwpose_person_index, no identity_lock_* fields, vlm_anchor_preset instead
+    of face_anchor_preset, anchor_names_used (strings) instead of
+    anchor_indices_used (ints).
+    """
+    seeds = seeds if seeds is not None else _default_seeds()
+    payload = {
+        "schema_type": "sam3_seed_prompts",
+        "schema_version": "1.3.0",
+        "schema_minor_compatible_with": "1.x",
+        "generator_node": "NV_VLMToSAM3Seeds",
+        "subject_class": "face",
+        "vlm_anchor_preset": "head_only",
+        "use_all_landmarks": False,
+        "landmark_vocab": ["L_ear", "L_eye_outer", "R_ear", "R_eye_outer",
+                            "head_top", "nose_tip"],
+        "anchor_names_used": ["L_ear", "L_eye_outer", "R_ear", "R_eye_outer",
+                              "head_top", "nose_tip"],
+        "active_anchor_preset": "head_only",
+        "frame_width": 1920,
+        "frame_height": 1080,
+        "total_frames": 100,
+        "seed_strategy": "manual_keyframes",
+        "normalization_space": "unit_xy",
+        "flagged_frame_mode": "restrict_only",
+        "flagged_frame_count": 0,
+        "effective_min_frames_between_seeds": 10,
+        "effective_force_include_first_frame": True,
+        "accepted_frames": [s["frame_idx"] for s in seeds],
+        "candidate_events_log": [],
+        "boundary_negatives": "none",
+        "seeds": seeds,
+    }
+    for k in (drop_keys or []):
+        payload.pop(k, None)
+    return json.dumps(payload)
+
+
+def test_vlm_payload_without_dwpose_person_index_passes():
+    """D-364 parity: VLM Seeds payload omits dwpose_person_index (DWPose-only
+    provenance field). Source-agnostic consumer must accept it."""
+    payload = _make_vlm_payload()
+    initial_state = FakeVideoState()
+    new_state, applied, _log = _call_node(payload, state=initial_state)
+    assert applied > 0, "VLM payload should apply at least one seed"
+    assert len(new_state.prompts) > len(initial_state.prompts)
+
+
+def test_vlm_payload_missing_seeds_still_raises():
+    """Negative control: relaxation does NOT loosen the truly-required keys."""
+    payload = _make_vlm_payload(drop_keys=["seeds"])
+    with pytest.raises(ValueError, match="missing required"):
+        _call_node(payload)
+
+
 def test_malformed_json_raises():
     with pytest.raises(ValueError, match="invalid JSON"):
         _call_node("not valid json {")

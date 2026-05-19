@@ -54,6 +54,7 @@ SAM3MultiFrameAddPrompt = _target_mod.SAM3MultiFrameAddPrompt
 _validate_schema_version = _target_mod._validate_schema_version
 _validate_required_keys = _target_mod._validate_required_keys
 _prescan_duplicates = _target_mod._prescan_duplicates
+_validate_and_convert_box_cxcywh_to_xyxy = _target_mod._validate_and_convert_box_cxcywh_to_xyxy
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +261,172 @@ def test_vlm_payload_missing_seeds_still_raises():
     payload = _make_vlm_payload(drop_keys=["seeds"])
     with pytest.raises(ValueError, match="missing required"):
         _call_node(payload)
+
+
+# ---------------------------------------------------------------------------
+# v1.4 box-field tests (AVM VLMtoBBoxAndPointsMultiFrame parity)
+# ---------------------------------------------------------------------------
+
+def _make_v1_4_payload(seeds=None, drop_keys=None):
+    """Build a VLMtoBBoxAndPointsMultiFrame-shaped payload (schema v1.4.0).
+
+    Mirrors the producer's emission. The headline difference vs v1.3 is the
+    optional per-seed `box: [cx, cy, w, h]` field (normalized in [0,1]).
+    """
+    if seeds is None:
+        seeds = [
+            {
+                "frame_idx": 5,
+                "obj_id": 1,
+                "pos_pts": [[0.5, 0.4], [0.6, 0.4]],
+                "neg_pts": [[0.1, 0.1]],
+                "box": [0.55, 0.45, 0.30, 0.40],
+            },
+        ]
+    payload = {
+        "schema_type": "sam3_seed_prompts",
+        "schema_version": "1.4.0",
+        "schema_minor_compatible_with": "1.x",
+        "generator_node": "VLMtoBBoxAndPointsMultiFrame",
+        "target_description": "the main subject",
+        "frame_width": 1920,
+        "frame_height": 1080,
+        "total_frames": 100,
+        "accepted_frames": [s["frame_idx"] for s in seeds],
+        "seeds": seeds,
+    }
+    for k in (drop_keys or []):
+        payload.pop(k, None)
+    return json.dumps(payload)
+
+
+def test_v1_4_payload_with_box_applies_both_points_and_box():
+    """Positive E2E: v1.4 payload with box + points results in TWO prompts
+    chained for the same (frame_idx, obj_id) — first a point prompt, then a
+    box prompt. State should advance by 2 prompts per seed."""
+    payload = _make_v1_4_payload()
+    initial_state = FakeVideoState()
+    new_state, applied, _log = _call_node(payload, state=initial_state)
+    assert applied == 1, f"expected applied=1, got {applied}"
+    # 1 point prompt + 1 box prompt = 2 new prompts
+    assert len(new_state.prompts) == 2, (
+        f"expected 2 prompts (point+box), got {len(new_state.prompts)}: "
+        f"{[getattr(p, 'prompt_type', '?') for p in new_state.prompts]}"
+    )
+    types = [getattr(p, "prompt_type", None) for p in new_state.prompts]
+    assert "point" in types and "box" in types, f"missing prompt type: {types}"
+
+
+def test_v1_4_payload_malformed_box_field_soft_skipped():
+    """Resilience: malformed box (wrong shape) is skipped at the box step,
+    but points still apply. Seed counts as 'applied'."""
+    seeds = [
+        {
+            "frame_idx": 5,
+            "obj_id": 1,
+            "pos_pts": [[0.5, 0.4], [0.6, 0.4]],
+            "neg_pts": [],
+            "box": [0.55, 0.45, 0.30],  # length 3, not 4 — malformed
+        },
+    ]
+    payload = _make_v1_4_payload(seeds=seeds)
+    initial_state = FakeVideoState()
+    new_state, applied, log_json = _call_node(payload, state=initial_state)
+    assert applied == 1, "points should still apply when box is malformed"
+    # Point prompt landed; box did not.
+    types = [getattr(p, "prompt_type", None) for p in new_state.prompts]
+    assert types == ["point"], f"expected only point prompt, got {types}"
+    log = json.loads(log_json)
+    assert any(s.get("field") == "box" for s in log), (
+        f"expected box-skip entry in log, got {log!r}"
+    )
+
+
+def test_v1_4_payload_with_null_box_treated_as_no_box():
+    """Cross-producer interop: explicit JSON null for the box field is
+    semantically equivalent to absence. AVM's producer never emits null —
+    it omits the key on failure — but other future producers (or hand-edited
+    payloads) might. The consumer's `box_raw is not None` guard handles both
+    cases identically: skip box step, apply points, seed counts as applied."""
+    seeds = [
+        {
+            "frame_idx": 5,
+            "obj_id": 1,
+            "pos_pts": [[0.5, 0.4]],
+            "neg_pts": [],
+            "box": None,  # explicit null, not absent
+        },
+    ]
+    payload = _make_v1_4_payload(seeds=seeds)
+    initial_state = FakeVideoState()
+    new_state, applied, log_json = _call_node(payload, state=initial_state)
+    assert applied == 1, "points should still apply when box is null"
+    # Only the point prompt — null box ≡ no box step
+    types = [getattr(p, "prompt_type", None) for p in new_state.prompts]
+    assert types == ["point"], f"expected only point prompt, got {types}"
+    # Importantly: null does NOT generate a "box" skip entry in the log
+    # (matches absent-key behavior; only malformed-but-present boxes log)
+    log = json.loads(log_json)
+    assert not any(s.get("field") == "box" for s in log), (
+        f"null box should NOT generate a skip log entry, got {log!r}"
+    )
+
+
+def test_v1_4_no_box_field_validates_as_required_keys_pass():
+    """Documentation assertion: v1.4 payload WITHOUT the box field is still
+    structurally valid — `box` is fully optional per schema design. Targeted
+    validator-only check (no full E2E run; existing 41 tests already exercise
+    the no-box happy path)."""
+    payload_dict = json.loads(_make_v1_4_payload(seeds=[{
+        "frame_idx": 5, "obj_id": 1, "pos_pts": [[0.5, 0.5]], "neg_pts": [],
+        # no "box" field
+    }]))
+    # Should NOT raise — validator is consumer-required-keys-only, box is producer-optional
+    _validate_required_keys(payload_dict)
+
+
+# ---------------------------------------------------------------------------
+# v1.4 box helper unit tests
+# ---------------------------------------------------------------------------
+
+def test_box_helper_accepts_valid_cxcywh():
+    ok, xyxy, reason = _validate_and_convert_box_cxcywh_to_xyxy([0.5, 0.5, 0.4, 0.4])
+    assert ok and reason == "ok"
+    assert xyxy == [0.3, 0.3, 0.7, 0.7], xyxy
+
+
+def test_box_helper_rejects_wrong_length():
+    ok, _, reason = _validate_and_convert_box_cxcywh_to_xyxy([0.5, 0.5, 0.4])
+    assert not ok and reason.startswith("box_wrong_length")
+
+
+def test_box_helper_rejects_non_numeric():
+    ok, _, reason = _validate_and_convert_box_cxcywh_to_xyxy([0.5, 0.5, "x", 0.4])
+    assert not ok and reason == "box_member_not_numeric"
+
+
+def test_box_helper_rejects_bool_member():
+    ok, _, reason = _validate_and_convert_box_cxcywh_to_xyxy([0.5, 0.5, True, 0.4])
+    assert not ok and reason == "box_member_not_numeric"
+
+
+def test_box_helper_rejects_non_positive_extent():
+    # w=0 → zero-area box
+    ok, _, reason = _validate_and_convert_box_cxcywh_to_xyxy([0.5, 0.5, 0.0, 0.4])
+    assert not ok and reason == "box_non_positive_extent"
+
+
+def test_box_helper_rejects_nan():
+    ok, _, reason = _validate_and_convert_box_cxcywh_to_xyxy([float("nan"), 0.5, 0.4, 0.4])
+    assert not ok and reason == "box_nan_inf"
+
+
+def test_box_helper_clamps_corners_into_unit_when_box_extends_past_edge():
+    # cx=0.9, w=0.4 → x2=1.1 (overshoots), should clamp to 1.0
+    ok, xyxy, reason = _validate_and_convert_box_cxcywh_to_xyxy([0.9, 0.5, 0.4, 0.2])
+    assert ok and reason == "ok"
+    assert xyxy[2] == 1.0, f"expected x2 clamped to 1.0, got {xyxy[2]}"
+    assert xyxy[0] == 0.7, f"expected x1=0.7, got {xyxy[0]}"
 
 
 def test_malformed_json_raises():

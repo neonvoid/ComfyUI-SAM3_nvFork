@@ -229,6 +229,53 @@ def _validate_and_clamp_coord(
     return (x, y, "ok")
 
 
+def _validate_and_convert_box_cxcywh_to_xyxy(box_raw: Any) -> Tuple[bool, list, str]:
+    """Validate v1.4+ per-seed `box` field and convert cxcywh→xyxy for SAM3.
+
+    Schema convention: [cx, cy, w, h] normalized in [0, 1] (matches the
+    SAM3_BOXES_PROMPT family produced by AVM single-frame nodes).
+    Consumer-side conversion target: [x1, y1, x2, y2] corner format expected
+    by VideoPrompt.create_box (see sam3_video_nodes.py:833 reference usage).
+
+    Returns (is_valid, xyxy_list_or_zeros, reason_or_ok).
+    reason_or_ok: 'ok' / 'box_wrong_type' / 'box_wrong_length' /
+                  'box_member_not_numeric' / 'box_nan_inf' /
+                  'box_out_of_range' / 'box_non_positive_extent'
+
+    Box is soft-validated independent of points — caller decides whether a
+    malformed box should kill the whole seed or just skip the box portion.
+    """
+    if not isinstance(box_raw, (list, tuple)):
+        return (False, [0.0, 0.0, 0.0, 0.0],
+                f"box_wrong_type:{type(box_raw).__name__}")
+    if len(box_raw) != 4:
+        return (False, [0.0, 0.0, 0.0, 0.0],
+                f"box_wrong_length:{len(box_raw)}")
+    # Reject bools explicitly (subclass of int → float() accepts them)
+    if any(isinstance(v, bool) for v in box_raw):
+        return (False, [0.0, 0.0, 0.0, 0.0], "box_member_not_numeric")
+    try:
+        cx, cy, w, h = float(box_raw[0]), float(box_raw[1]), float(box_raw[2]), float(box_raw[3])
+    except (TypeError, ValueError):
+        return (False, [0.0, 0.0, 0.0, 0.0], "box_member_not_numeric")
+    if not all(math.isfinite(v) for v in (cx, cy, w, h)):
+        return (False, [0.0, 0.0, 0.0, 0.0], "box_nan_inf")
+    # Range check with epsilon tolerance — mirrors point validator
+    lo, hi = -COORD_EPSILON, 1.0 + COORD_EPSILON
+    if not all(lo <= v <= hi for v in (cx, cy)):
+        return (False, [0.0, 0.0, 0.0, 0.0], "box_out_of_range")
+    if not (0.0 < w <= hi and 0.0 < h <= hi):
+        return (False, [0.0, 0.0, 0.0, 0.0], "box_non_positive_extent")
+    # Convert cxcywh → xyxy + clamp corners into [0, 1]
+    x1 = max(0.0, min(1.0, cx - w / 2.0))
+    y1 = max(0.0, min(1.0, cy - h / 2.0))
+    x2 = max(0.0, min(1.0, cx + w / 2.0))
+    y2 = max(0.0, min(1.0, cy + h / 2.0))
+    if x2 <= x1 or y2 <= y1:
+        return (False, [0.0, 0.0, 0.0, 0.0], "box_non_positive_extent")
+    return (True, [x1, y1, x2, y2], "ok")
+
+
 class SAM3MultiFrameAddPrompt:
     """D-354 — Batch apply N DWPose-derived point prompts onto SAM3_VIDEO_STATE.
 
@@ -499,7 +546,7 @@ class SAM3MultiFrameAddPrompt:
                 })
                 continue
 
-            # Construct + chain
+            # Construct + chain (points first)
             try:
                 prompt = VideoPrompt.create_point(
                     frame_idx, obj_id,
@@ -517,13 +564,44 @@ class SAM3MultiFrameAddPrompt:
                 })
                 continue
 
+            # v1.4+ optional `box` field — chain a box prompt on top of the points
+            # for the same (frame_idx, obj_id). Schema: [cx, cy, w, h] normalized.
+            # Per R2 reviewers: box-malformed is per-seed soft-skip (points still
+            # applied), 3-valued log state (true/false/skipped_malformed).
+            box_state = "false"  # default: no box field in payload
+            box_raw = seed.get("box", None)
+            if box_raw is not None:
+                box_valid, box_xyxy, box_reject_reason = _validate_and_convert_box_cxcywh_to_xyxy(box_raw)
+                if box_valid:
+                    try:
+                        box_prompt = VideoPrompt.create_box(
+                            frame_idx, obj_id, box_xyxy, is_positive=True
+                        )
+                        state_cur = state_cur.with_prompt(box_prompt)
+                        box_state = "true"
+                    except Exception as e:
+                        # Box creation failure is soft — points already applied.
+                        # Log but don't skip the whole seed.
+                        skipped.append({
+                            "seed_index": i, "frame_idx": frame_idx, "obj_id": obj_id,
+                            "reason": "box_with_prompt_failed",
+                            "detail": str(e),
+                        })
+                        box_state = "skipped_malformed"
+                else:
+                    skipped.append({
+                        "seed_index": i, "frame_idx": frame_idx, "obj_id": obj_id,
+                        "reason": box_reject_reason, "field": "box",
+                    })
+                    box_state = "skipped_malformed"
+
             collision_set.add(collision_key)
             applied_count += 1
             if verbose_debug:
                 print(
                     f"{_PREFIX} applied seed[{i}] frame={frame_idx} "
                     f"obj_id={obj_id} pos={len([l for l in all_labels if l == 1])} "
-                    f"neg={len([l for l in all_labels if l == 0])}"
+                    f"neg={len([l for l in all_labels if l == 0])} box={box_state}"
                 )
 
         if applied_count == 0:

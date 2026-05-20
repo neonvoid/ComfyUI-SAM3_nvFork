@@ -3226,6 +3226,255 @@ class SAM3MaskToVideo:
 # Mask Refinement
 # =============================================================================
 
+# =============================================================================
+# SAM3MaskRefine compose helpers (2026-05-20 audit Bug #2 — corrective compose).
+#
+# The SAM3 tracker enforces mutual exclusion between mask + point/box prompts
+# at the same (frame_idx, obj_id): `add_new_mask` clears point_inputs_per_frame
+# and `add_new_points_or_box` clears mask_inputs_per_frame
+# (sam3_lib/model/sam3_tracking_predictor.py:266,406). They CANNOT coexist as
+# separate inputs.
+#
+# To preserve both inputs' intent without violating the tracker contract, we
+# pre-compose a SINGLE mask at the corrective frame:
+#   1. Run image-mode SAM3 segmentation on that frame with the user's
+#      points/box → "corrective_mask" (SAM3's interpretation of the prompts)
+#   2. Combine with the user's input_mask using a chosen op (union/intersect/
+#      replace/diff). Default `auto` picks op from prompt polarity.
+#   3. Feed the composed mask via add_new_mask as a single prompt.
+#
+# This sidesteps the tracker-level mutual-exclusion entirely. v1 scope is
+# single-subject only (user confirmed 2026-05-20) — multi-object compose is a
+# v2 follow-up.
+# =============================================================================
+
+_VALID_COMPOSE_MODES = ("skip", "auto", "union", "intersect", "replace", "diff")
+
+
+def _validate_compose_mode(mode: str) -> None:
+    """Raise ValueError if `mode` is not a recognized corrective_compose_mode.
+
+    Factored out so the validation is directly unit-testable without hitting
+    any downstream propagation work (R1 review follow-up — Codex).
+    """
+    if mode not in _VALID_COMPOSE_MODES:
+        raise ValueError(
+            f"[SAM3 MaskRefine] corrective_compose_mode='{mode}' "
+            f"not in {_VALID_COMPOSE_MODES}"
+        )
+
+
+def _resolve_compose_op(
+    mode: str,
+    has_positive: bool,
+    has_negative: bool,
+) -> str:
+    """Auto-pick op from prompt polarity, or honor explicit override.
+
+    Modes:
+      auto      — positive-only → union; negative-only → diff;
+                  mixed (both polarities) → replace (trust image-mode result)
+      union     — force mask_in OR corrective
+      intersect — force mask_in AND corrective (conservative)
+      replace   — force corrective only (trust image-mode entirely)
+      diff      — force mask_in AND NOT corrective (subtract)
+    """
+    if mode != "auto":
+        return mode
+    if has_negative and not has_positive:
+        return "diff"
+    if has_positive and has_negative:
+        return "replace"
+    return "union"  # positive-only or no-op
+
+
+def _compose_masks(base_mask: torch.Tensor, corrective_mask: torch.Tensor, op: str) -> torch.Tensor:
+    """Element-wise compose two [H, W] float masks in [0, 1] range.
+
+    Both tensors must be same shape. Caller responsible for shape match.
+    """
+    if op == "union":
+        return torch.maximum(base_mask, corrective_mask)
+    if op == "intersect":
+        return torch.minimum(base_mask, corrective_mask)
+    if op == "replace":
+        return corrective_mask.clone()
+    if op == "diff":
+        return base_mask * (1.0 - corrective_mask)
+    raise ValueError(
+        f"[SAM3 MaskRefine] Unknown compose op '{op}'. "
+        f"Expected one of: auto, union, intersect, replace, diff."
+    )
+
+
+def _run_image_mode_segmentation(
+    sam3_model,
+    frame_tensor: torch.Tensor,
+    positive_points_dict,
+    negative_points_dict,
+    positive_boxes_dict,
+    negative_boxes_dict,
+) -> Optional[torch.Tensor]:
+    """Run image-mode SAM3 segmentation on a single frame to materialize a mask
+    from points/box prompts. Returns a [H, W] float mask in [0, 1] range, or
+    None if no usable prompts.
+
+    Uses the same processor.set_image + model.predict_inst path as
+    SAM3Segmentation in segmentation.py. Single-subject only — multi-object
+    `objects` dict format on positive_points is NOT supported in this path
+    (user-confirmed v1 scope 2026-05-20: refine input is identity-isolated).
+    """
+    from .utils import comfy_image_to_pil
+
+    # Convert tensor [H, W, C] (single frame) to a batched [1, H, W, C] image
+    # tensor as comfy_image_to_pil expects (it selects index 0 internally).
+    if frame_tensor.dim() == 3:
+        img_batch = frame_tensor.unsqueeze(0)
+    else:
+        img_batch = frame_tensor
+    pil_image = comfy_image_to_pil(img_batch)
+    img_w, img_h = pil_image.size
+
+    processor = sam3_model.processor
+    model = processor.model
+
+    # Interactive predictor required — same precondition SAM3Segmentation has.
+    if getattr(model, "inst_interactive_predictor", None) is None:
+        print(
+            "[SAM3 MaskRefine] WARN: inst_interactive_predictor unavailable; "
+            "cannot run image-mode segmentation for compose path. "
+            "Falling back to base mask (no compose)."
+        )
+        return None
+
+    if hasattr(processor, "sync_device_with_model"):
+        processor.sync_device_with_model()
+
+    state = processor.set_image(pil_image)
+
+    # Collect points + labels in PIXEL coords. Handles both legacy single-
+    # object format ({"points": [...]}) AND the multi-object format that the
+    # SAM3PointCollector emits ({"objects": [{positive_points, negative_points,
+    # ...}, ...]}). For v1 single-subject scope we use the FIRST object only
+    # if multi-object arrives; both polarities are extracted from that object.
+    #
+    # R1 review fix (Gemini): pre-fix parser only extracted `positive_points`
+    # when label_val=1, silently dropping multi-object negatives entirely.
+    # Post-fix: when multi-object dict is encountered, extract BOTH polarities
+    # at once regardless of which caller arg we're processing.
+    all_points: list = []
+    all_labels: list = []
+
+    def _extend_with_pixel_points(pts_iterable, label_val):
+        for pt in pts_iterable:
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                all_points.append([float(pt[0]) * img_w, float(pt[1]) * img_h])
+                all_labels.append(label_val)
+
+    multi_object_consumed = False
+
+    def _add_points_dict(pts_dict, default_label):
+        nonlocal multi_object_consumed
+        if not pts_dict:
+            return
+        if pts_dict.get("objects"):
+            # Multi-object dict embeds BOTH polarities inside the first object's
+            # positive_points/negative_points lists. Consume both polarities
+            # exactly once — track so the negative_points_dict pass doesn't
+            # re-walk the same payload.
+            if multi_object_consumed:
+                return
+            first = pts_dict["objects"][0] if pts_dict["objects"] else {}
+            _extend_with_pixel_points(first.get("positive_points", []), 1)
+            _extend_with_pixel_points(first.get("negative_points", []), 0)
+            multi_object_consumed = True
+            return
+        # Legacy single-object format
+        _extend_with_pixel_points(pts_dict.get("points", []), default_label)
+
+    _add_points_dict(positive_points_dict, 1)
+    _add_points_dict(negative_points_dict, 0)
+
+    # Positive box: predict_inst takes one box as a region constraint. We use
+    # only the first positive box (matches SAM3Segmentation.segment() semantics).
+    box_array = None
+    if positive_boxes_dict and positive_boxes_dict.get("boxes"):
+        b = positive_boxes_dict["boxes"][0]
+        cx, cy, bw, bh = b
+        x1 = (cx - bw / 2.0) * img_w
+        y1 = (cy - bh / 2.0) * img_h
+        x2 = (cx + bw / 2.0) * img_w
+        y2 = (cy + bh / 2.0) * img_h
+        box_array = np.array([x1, y1, x2, y2], dtype=np.float32)
+
+    # Negative box → encode as a negative point at the box centroid.
+    # R1 review fix (Gemini): pre-fix dropped negative_boxes entirely, then
+    # Step 3 added them as direct prompts AFTER the composed mask — triggering
+    # the mutual-exclusion clear. Post-fix: rasterize negatives as in-prompt
+    # negative points so predict_inst incorporates them into the corrective_mask
+    # and Step 3 then nulls them out (no separate add_new_points call needed).
+    if negative_boxes_dict and negative_boxes_dict.get("boxes"):
+        for b in negative_boxes_dict["boxes"]:
+            cx, cy, _bw, _bh = b
+            all_points.append([float(cx) * img_w, float(cy) * img_h])
+            all_labels.append(0)
+
+    # Short-circuit: image-mode predict_inst REQUIRES at least one positive
+    # signal (positive point OR positive box). With only negatives, the call
+    # has no anchor and returns garbage. R1 review (Codex): document and guard.
+    # Return None so the caller falls through to base mask — the user's negative
+    # intent is lost in this v1 contract; document as limitation.
+    has_positive_anchor = (
+        any(lbl == 1 for lbl in all_labels) or box_array is not None
+    )
+    has_any_signal = bool(all_points) or box_array is not None
+    if not has_any_signal:
+        return None
+    if not has_positive_anchor:
+        print(
+            "[SAM3 MaskRefine] WARN: image-mode segmentation needs at least one "
+            "positive point or positive box to anchor; got negative-only "
+            "prompts. Falling back to base mask (compose no-op). v1 limitation."
+        )
+        return None
+
+    point_coords = np.array(all_points, dtype=np.float32) if all_points else None
+    point_labels = np.array(all_labels, dtype=np.int32) if all_labels else None
+
+    # R1 review fix (Codex): wrap predict_inst in try/finally so backbone
+    # features get released even on exception. Without this, image features
+    # stay live indefinitely on GPU when an upstream raise propagates.
+    try:
+        masks_np, scores_np, _low_res = model.predict_inst(
+            state,
+            point_coords=point_coords,
+            point_labels=point_labels,
+            box=box_array,
+            mask_input=None,
+            multimask_output=True,
+            normalize_coords=True,
+        )
+    finally:
+        del state
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if masks_np is None or len(masks_np) == 0:
+        print(
+            "[SAM3 MaskRefine] WARN: image-mode segmentation returned no masks; "
+            "compose falls back to base mask."
+        )
+        return None
+
+    # Pick highest-scoring candidate.
+    best_idx = int(np.argmax(scores_np)) if scores_np is not None else 0
+    best_np = masks_np[best_idx].astype(np.float32)
+    # predict_inst returns binary at image resolution; clamp to [0, 1] just in case.
+    best_np = np.clip(best_np, 0.0, 1.0)
+    return torch.from_numpy(best_np)
+
+
 class SAM3MaskRefine:
     """
     Refine existing masks by feeding them back into SAM3 as conditioning.
@@ -3238,6 +3487,15 @@ class SAM3MaskRefine:
     Typical workflow:
         SAM3VideoSegmentation -> SAM3Propagate -> SAM3VideoOutput -> SAM3MaskRefine
         (first pass tracking)                     (extract masks)   (refine pass)
+
+    Corrective compose (2026-05-20 audit Bug #2):
+        SAM3's tracker enforces mutual exclusion between mask + point/box
+        prompts at the same (frame_idx, obj_id) — see file:line citations in
+        the _resolve_compose_op docstring above. To honor BOTH inputs at a
+        corrective frame, set `corrective_compose_mode != "skip"` and the node
+        will pre-compose a single mask via image-mode SAM3 segmentation +
+        union/diff op. Default "skip" preserves pre-2026-05-20 behavior for
+        back-compat.
     """
     # Bounded session-scoped cache (replaces legacy `_cache = {}`).
     # max_size=2: refine results include full mask sequences and visualizations.
@@ -3303,6 +3561,33 @@ class SAM3MaskRefine:
                     "default": False,
                     "tooltip": "Move model to CPU after refinement to free VRAM"
                 }),
+                # Appended at end of optional block per D-201 widget-position
+                # rule. New widget default ("skip") preserves pre-2026-05-20
+                # behavior — saved workflows with no corrective_compose_mode
+                # value see no change.
+                "corrective_compose_mode": (
+                    ["skip", "auto", "union", "intersect", "replace", "diff"],
+                    {
+                        "default": "skip",
+                        "tooltip": (
+                            "How to handle the collision when corrective "
+                            "points/box land on the same frame as a mask "
+                            "keyframe. SAM3's tracker enforces mutual "
+                            "exclusion between mask and point/box at the "
+                            "same (frame, obj_id) — they cannot coexist as "
+                            "separate prompts. Modes: "
+                            "skip (default) = legacy behavior, drop the "
+                            "mask keyframe at corrective_frame so points "
+                            "take effect. "
+                            "auto = run image-mode SAM3 on the corrective "
+                            "prompts and compose with input_mask (positive-"
+                            "only → union, negative-only → diff, mixed → "
+                            "replace). RECOMMENDED for new workflows. "
+                            "union / intersect / replace / diff = force a "
+                            "specific compose op regardless of polarity."
+                        ),
+                    },
+                ),
             }
         }
 
@@ -3313,13 +3598,15 @@ class SAM3MaskRefine:
                    positive_boxes=None, negative_boxes=None,
                    frame_idx=0, obj_id=1,
                    offload_video_to_cpu=True, offload_state_to_cpu=False,
-                   offload_model=False):
+                   offload_model=False,
+                   corrective_compose_mode="skip"):
         if video_frames is None or input_masks is None:
             return float("NaN")
         return (id(video_frames), id(input_masks), keyframe_interval, merge_mode,
                 str(positive_points), str(negative_points),
                 str(positive_boxes), str(negative_boxes),
-                frame_idx, obj_id, offload_video_to_cpu, offload_state_to_cpu)
+                frame_idx, obj_id, offload_video_to_cpu, offload_state_to_cpu,
+                corrective_compose_mode)
 
     RETURN_TYPES = ("MASK", "IMAGE")
     RETURN_NAMES = ("masks", "visualization")
@@ -3350,12 +3637,20 @@ class SAM3MaskRefine:
                positive_boxes=None, negative_boxes=None,
                frame_idx=0, obj_id=1,
                offload_video_to_cpu=True, offload_state_to_cpu=False,
-               offload_model=False):
+               offload_model=False,
+               corrective_compose_mode="skip"):
         """Refine masks by feeding keyframes back into SAM3."""
         # Defaults for older workflows
         keyframe_interval = keyframe_interval if keyframe_interval is not None else 10
         merge_mode = merge_mode if merge_mode is not None else "union"
         obj_id = obj_id if obj_id is not None else 1
+        corrective_compose_mode = (
+            corrective_compose_mode if corrective_compose_mode is not None else "skip"
+        )
+        # R2 refactor: validation delegated to module-level helper so it's
+        # directly unit-testable without instantiating the node + dragging in
+        # the rest of the refine pipeline.
+        _validate_compose_mode(corrective_compose_mode)
 
         # --- Cache check ---
         # Content-derived semantic key (no id()). SAM3MaskRefine has no
@@ -3371,6 +3666,7 @@ class SAM3MaskRefine:
             _scalar_or_str(positive_points), _scalar_or_str(negative_points),
             _scalar_or_str(positive_boxes), _scalar_or_str(negative_boxes),
             frame_idx, obj_id, offload_video_to_cpu, offload_state_to_cpu,
+            corrective_compose_mode,
         )
 
         if cache_key in SAM3MaskRefine._cache:
@@ -3414,21 +3710,61 @@ class SAM3MaskRefine:
               f"{num_frames} frames, {w}x{h} ({_t_state - _t_start:.1f}s)")
 
         # --- Step 2: Add mask prompts at keyframe intervals ---
-        # Determine which frames have corrective prompts so we skip those.
-        # SAM3 internally treats point and mask prompts as mutually exclusive
-        # on the same (frame_idx, obj_id) — the last one applied erases the
-        # other (add_new_mask clears points, add_new_points clears masks).
-        # So if the user provides corrective clicks on a frame, we let the
-        # clicks take priority and skip the mask keyframe there.
+        # SAM3's tracker enforces mutual exclusion between mask + point/box at
+        # the same (frame_idx, obj_id) — `add_new_mask` clears point inputs,
+        # `add_new_points_or_box` clears mask inputs (verified at
+        # sam3_lib/model/sam3_tracking_predictor.py:266,406). They can't coexist.
+        #
+        # When corrective_compose_mode != "skip", we pre-compose a single mask
+        # at the corrective frame: run image-mode SAM3 with the user's points/
+        # box → corrective_mask, then combine with input_mask via the chosen op
+        # (auto/union/intersect/replace/diff). Single composed mask feeds the
+        # tracker via add_new_mask — no contract violation. v1 scope is single-
+        # subject only (caller's obj_id parameter, no multi-object compose).
+        # R1 review fix (Gemini): the multi-object format on positive_points
+        # embeds both positive and negative points inside `objects[].positive_points`
+        # and `objects[].negative_points`. Pre-fix has_corrective_negs only
+        # checked legacy `negative_points.points`, missing multi-object negs
+        # entirely → auto picked wrong op. Post-fix: check both formats.
+        _multi_obj_pos = bool(
+            positive_points and positive_points.get("objects")
+            and any(o.get("positive_points") for o in positive_points["objects"])
+        )
+        _multi_obj_neg = bool(
+            positive_points and positive_points.get("objects")
+            and any(o.get("negative_points") for o in positive_points["objects"])
+        )
+        has_corrective_points = bool(
+            (positive_points and positive_points.get("points")) or _multi_obj_pos
+        )
+        has_corrective_negs = bool(
+            (negative_points and negative_points.get("points")) or _multi_obj_neg
+        )
+        has_corrective_pos_boxes = bool(positive_boxes and positive_boxes.get("boxes"))
+        has_corrective_neg_boxes = bool(negative_boxes and negative_boxes.get("boxes"))
         has_corrective = (
-            (positive_points and (positive_points.get("objects") or positive_points.get("points")))
-            or (positive_boxes and positive_boxes.get("boxes"))
-            or (negative_boxes and negative_boxes.get("boxes"))
+            has_corrective_points or has_corrective_negs
+            or has_corrective_pos_boxes or has_corrective_neg_boxes
         )
         corrective_frame = frame_idx if has_corrective else -1
+        compose_active = (
+            has_corrective
+            and corrective_compose_mode != "skip"
+            and 0 <= corrective_frame < num_frames
+        )
+
+        # Build the set of keyframes to add. Standard interval keyframes plus
+        # the corrective_frame itself when compose mode is active (so the
+        # composed mask is added even if corrective_frame doesn't align with
+        # the interval grid).
+        keyframes_to_add = set(range(0, num_frames, keyframe_interval))
+        if compose_active:
+            keyframes_to_add.add(corrective_frame)
+        ordered_keyframes = sorted(keyframes_to_add)
 
         keyframes_added = 0
-        num_keyframes = len(range(0, num_frames, keyframe_interval))
+        composed_at_frame = -1  # tracks which frame got the composed mask
+        num_keyframes = len(ordered_keyframes)
         mask_pixels = h * w
 
         # Warn about memory if many large masks will be stored as flattened tuples
@@ -3438,11 +3774,14 @@ class SAM3MaskRefine:
                   f"at {w}x{h} will use ~{estimated_mb:.0f}MB RAM in video state. "
                   f"Consider increasing keyframe_interval to reduce memory usage.")
 
-        for kf_idx in range(0, num_frames, keyframe_interval):
-            # Skip keyframe if corrective prompts target this frame
-            if kf_idx == corrective_frame:
+        for kf_idx in ordered_keyframes:
+            is_corrective_kf = (kf_idx == corrective_frame and has_corrective)
+
+            # Legacy "skip" path: drop the mask keyframe so corrective prompts
+            # take effect via the standard add_new_points_or_box path in Step 3.
+            if is_corrective_kf and corrective_compose_mode == "skip":
                 print(f"[SAM3 MaskRefine] Skipping mask keyframe {kf_idx} "
-                      f"(corrective prompts take priority on this frame)")
+                      f"(corrective prompts take priority; compose_mode=skip)")
                 continue
 
             frame_mask = input_masks[kf_idx].float()
@@ -3450,11 +3789,6 @@ class SAM3MaskRefine:
             # Normalize to 0-1
             if frame_mask.max() > 1.0:
                 frame_mask = frame_mask / 255.0
-
-            # Skip empty masks
-            if frame_mask.sum() < 100:
-                print(f"[SAM3 MaskRefine] Skipping empty keyframe {kf_idx}")
-                continue
 
             # Resize if needed
             mask_h, mask_w = frame_mask.shape[-2], frame_mask.shape[-1]
@@ -3466,6 +3800,54 @@ class SAM3MaskRefine:
                     align_corners=False,
                 ).squeeze(0).squeeze(0)
 
+            # Compose path: run image-mode SAM3 on the corrective prompts and
+            # combine with the input mask. Falls through to base mask if
+            # image-mode returns nothing or no usable prompts.
+            if is_corrective_kf and compose_active:
+                corrective_mask = _run_image_mode_segmentation(
+                    sam3_model,
+                    video_frames[kf_idx],
+                    positive_points,
+                    negative_points,
+                    positive_boxes,
+                    negative_boxes,
+                )
+                if corrective_mask is not None:
+                    # Match input-mask resolution.
+                    if corrective_mask.shape[-2:] != (h, w):
+                        corrective_mask = torch.nn.functional.interpolate(
+                            corrective_mask.unsqueeze(0).unsqueeze(0),
+                            size=(h, w),
+                            mode='bilinear',
+                            align_corners=False,
+                        ).squeeze(0).squeeze(0)
+                    has_pos = has_corrective_points or has_corrective_pos_boxes
+                    has_neg = has_corrective_negs or has_corrective_neg_boxes
+                    resolved_op = _resolve_compose_op(
+                        corrective_compose_mode, has_pos, has_neg
+                    )
+                    composed = _compose_masks(frame_mask, corrective_mask, resolved_op)
+                    print(
+                        f"[SAM3 MaskRefine] Composed corrective mask at frame "
+                        f"{kf_idx} via op='{resolved_op}' "
+                        f"(mode={corrective_compose_mode}, "
+                        f"has_pos={has_pos}, has_neg={has_neg})"
+                    )
+                    frame_mask = composed
+                    composed_at_frame = kf_idx
+                else:
+                    print(
+                        f"[SAM3 MaskRefine] Compose at frame {kf_idx} fell "
+                        f"through to base mask (no usable corrective prompts "
+                        f"or image-mode returned empty)"
+                    )
+
+            # Skip empty masks (post-compose). Threshold kept at 100 for
+            # back-compat with existing behavior.
+            if frame_mask.sum() < 100:
+                print(f"[SAM3 MaskRefine] Skipping empty keyframe {kf_idx}")
+                continue
+
             prompt = VideoPrompt.create_mask(
                 frame_idx=kf_idx,
                 obj_id=obj_id,
@@ -3475,9 +3857,46 @@ class SAM3MaskRefine:
             keyframes_added += 1
 
         print(f"[SAM3 MaskRefine] Added {keyframes_added} mask keyframes "
-              f"(interval={keyframe_interval})")
+              f"(interval={keyframe_interval}, compose_mode={corrective_compose_mode})")
 
         # --- Step 3: Add optional corrective prompts ---
+        # Suppression rule (R2 review fold-in — Codex Medium):
+        #
+        # If compose_active is True the user explicitly requested compose
+        # semantics. We must NOT add direct point/box prompts at the corrective
+        # frame in that case — even when _run_image_mode_segmentation returned
+        # None (negative-only inputs, missing predictor, empty image-mode
+        # result). Pre-R3 guard only suppressed when compose SUCCEEDED
+        # (composed_at_frame == corrective_frame), which meant a fallback-to-
+        # base-mask path still added the corrective prompts via add_new_points_
+        # or_box → triggered the tracker's mutual-exclusion clear → wiped the
+        # base mask keyframe we just added. Exactly the bug the compose path
+        # was meant to eliminate.
+        #
+        # New rule: when compose_active, ALWAYS suppress direct prompts. Log
+        # whether compose actually produced a mask, so the user can see if
+        # corrective intent landed or fell through.
+        if compose_active:
+            if composed_at_frame == corrective_frame:
+                print(
+                    f"[SAM3 MaskRefine] Corrective prompts at frame {frame_idx} "
+                    f"composed into mask via Step 2 (op resolved); skipping "
+                    f"direct add to avoid mutual-exclusion clear."
+                )
+            else:
+                print(
+                    f"[SAM3 MaskRefine] WARN: compose was requested at frame "
+                    f"{frame_idx} but image-mode segmentation returned no "
+                    f"mask (negative-only / no predictor / empty result). "
+                    f"Base mask kept; direct corrective prompts SUPPRESSED to "
+                    f"protect that mask. To use direct prompts, set "
+                    f"corrective_compose_mode='skip'."
+                )
+            positive_points = None
+            negative_points = None
+            positive_boxes = None
+            negative_boxes = None
+
         prompts_added = 0
 
         if positive_points:

@@ -88,27 +88,73 @@ class SAM3MaskTracks:
         if output_bboxes:
             print(f"[SAM3 MaskTracks] Bounding box output enabled (padding={bbox_padding}px)")
 
-        # Helper to extract tensor from mask data (handles both dict and raw tensor formats)
-        def get_mask_tensor(mask_data):
-            """Extract mask tensor from mask data (dict or raw tensor)."""
+        # Helper to extract mask tensor + obj_ids from mask data.
+        # Returns (tensor, obj_ids_or_None). When obj_ids is None, caller must
+        # fall back to legacy channel-index semantics (raw-tensor or empty-list
+        # cases). When obj_ids is a list, caller MUST use it to map local
+        # channels to stable SAM3 object identities — assuming channel index ==
+        # obj_id is the 2026-05-20 audit bug that silently swaps identities on
+        # any clip where SAM3 returns sparse or reordered ids.
+        def get_mask_data(mask_data):
             if isinstance(mask_data, dict):
-                # New format: {"mask": tensor, "obj_ids": [...]}
-                return mask_data.get("mask")
-            return mask_data
+                # Canonical format from SAM3Propagate:
+                # {"mask": tensor[local_N, H, W], "obj_ids": [sam3_id_per_channel]}
+                tensor = mask_data.get("mask")
+                ids = mask_data.get("obj_ids")
+                # Empty/None ids list → fall through to legacy channel-index mode.
+                if not ids:
+                    return tensor, None
+                return tensor, list(ids)
+            # Raw-tensor legacy mode — no per-frame id metadata available.
+            return mask_data, None
 
-        # Determine number of objects from mask data
-        num_objects = 0
+        # First pass: discover the global set of SAM3 object IDs ever seen.
+        # When dict-with-obj_ids is provided, this is the union of all per-frame
+        # obj_ids sorted ascending. When falling back to raw-tensor mode (or any
+        # frame's dict has empty obj_ids), we use channel-index as a synthetic
+        # obj_id so existing workflows that wire raw tensors keep working.
+        global_obj_id_set = set()
+        max_legacy_channels = 0
+        any_real_ids = False
         for frame_idx in range(num_frames):
-            if frame_idx in masks:
-                frame_mask = get_mask_tensor(masks[frame_idx])
-                if frame_mask is None:
-                    continue
-                if isinstance(frame_mask, np.ndarray):
-                    frame_mask = torch.from_numpy(frame_mask)
-                if frame_mask.dim() == 3:
-                    num_objects = max(num_objects, frame_mask.shape[0])
-                elif frame_mask.dim() == 2:
-                    num_objects = max(num_objects, 1)
+            if frame_idx not in masks:
+                continue
+            frame_mask, frame_obj_ids = get_mask_data(masks[frame_idx])
+            if frame_mask is None:
+                continue
+            if isinstance(frame_mask, np.ndarray):
+                tensor_for_shape = torch.from_numpy(frame_mask)
+            else:
+                tensor_for_shape = frame_mask
+            # Determine local channel count for legacy path.
+            if tensor_for_shape.dim() == 4:
+                local_n = tensor_for_shape.shape[1]
+            elif tensor_for_shape.dim() == 3:
+                local_n = tensor_for_shape.shape[0]
+            elif tensor_for_shape.dim() == 2:
+                local_n = 1
+            else:
+                continue
+            if frame_obj_ids is not None:
+                any_real_ids = True
+                # Take only as many ids as channels available — guard against
+                # producer/tensor length mismatch.
+                for sam3_id in frame_obj_ids[:local_n]:
+                    global_obj_id_set.add(int(sam3_id))
+            else:
+                max_legacy_channels = max(max_legacy_channels, local_n)
+
+        # Resolve global ordering.
+        # SAM3-real-ids path: sorted union of all seen SAM3 obj_ids. Stable
+        # across frames. Channel position = position in this sorted list.
+        # Legacy path: 0..N-1 channel indices (current behavior preserved when
+        # no obj_ids metadata is supplied anywhere).
+        if any_real_ids:
+            global_obj_ids = sorted(global_obj_id_set)
+        else:
+            global_obj_ids = list(range(max_legacy_channels))
+        obj_id_to_channel = {oid: idx for idx, oid in enumerate(global_obj_ids)}
+        num_objects = len(global_obj_ids)
 
         if num_objects == 0:
             print("[SAM3 MaskTracks] No objects found in masks")
@@ -120,14 +166,26 @@ class SAM3MaskTracks:
             }, indent=2)
             return (empty_masks, empty_masks, track_info, 0)
 
-        print(f"[SAM3 MaskTracks] Found {num_objects} objects")
+        if any_real_ids:
+            print(
+                f"[SAM3 MaskTracks] Found {num_objects} objects "
+                f"(SAM3 obj_ids: {global_obj_ids})"
+            )
+        else:
+            print(
+                f"[SAM3 MaskTracks] Found {num_objects} objects "
+                f"(legacy channel-index mode — no obj_ids metadata in input)"
+            )
 
-        # Build [N_frames, N_objects, H, W] tensor
+        # Build [N_frames, N_objects, H, W] tensor — second dim indexed by
+        # STABLE global channel (SAM3 obj_id position when available, else
+        # legacy channel index).
         all_masks = torch.zeros(num_frames, num_objects, h, w)
 
-        # Track per-object visibility info
+        # Track per-object visibility info keyed by global channel.
         object_info = {
-            i: {
+            ch: {
+                "sam3_obj_id": global_obj_ids[ch],
                 "first_frame": None,
                 "last_frame": None,
                 "visible_frames": 0,
@@ -135,15 +193,20 @@ class SAM3MaskTracks:
                 "scores": [],
                 "bboxes": {}  # frame_idx -> [x1, y1, x2, y2]
             }
-            for i in range(num_objects)
+            for ch in range(num_objects)
         }
 
         # Also build bbox_masks if requested
         bbox_masks = torch.zeros(num_frames, num_objects, h, w) if output_bboxes else None
 
+        # Counter for legacy/raw frames encountered while in real-id mode —
+        # those frames cannot be safely positional-mapped into real-id channels
+        # (Codex R2 finding 2026-05-20). Surfaces in track_info as a diagnostic.
+        inconsistent_metadata_frames = 0
+
         for frame_idx in range(num_frames):
             if frame_idx in masks:
-                frame_mask = get_mask_tensor(masks[frame_idx])
+                frame_mask, frame_obj_ids = get_mask_data(masks[frame_idx])
                 if frame_mask is None:
                     continue
 
@@ -151,14 +214,67 @@ class SAM3MaskTracks:
                 if isinstance(frame_mask, np.ndarray):
                     frame_mask = torch.from_numpy(frame_mask)
 
-                # Handle different mask shapes
+                # Handle different mask shapes.
+                # 4D guard (Codex R2 finding): pre-fix code did frame_mask.squeeze(0)
+                # blindly; for B>1 the result is still 4D and neither the 3D nor
+                # 2D branch handles it. Raise loud — the SAM3 propagate contract
+                # is single-batch per frame; B>1 is a wiring bug, not a valid case.
                 if frame_mask.dim() == 4:
-                    frame_mask = frame_mask.squeeze(0)  # Remove batch dim
+                    if frame_mask.shape[0] != 1:
+                        raise ValueError(
+                            f"[SAM3 MaskTracks] Frame {frame_idx} mask has 4D "
+                            f"shape {tuple(frame_mask.shape)} with batch>1. "
+                            f"SAM3 propagate is contracted to emit one batch "
+                            f"per frame. This indicates a wiring bug upstream."
+                        )
+                    frame_mask = frame_mask.squeeze(0)  # Remove single batch dim
+
+                # Resolve per-frame local-channel → global-channel mapping.
+                # In SAM3-real-ids mode, each local channel's obj_id tells us
+                # which stable global slot to write to. In legacy mode, local
+                # channel position == global channel position.
+                #
+                # Codex R2 finding 2026-05-20: when any_real_ids=True (we
+                # committed to real-id channel ordering globally) but THIS
+                # frame has no obj_ids metadata (raw tensor or empty list),
+                # the pre-R2 code silently fell back to positional mapping —
+                # which placed an UNKNOWN identity into the sorted real-id
+                # channel position. That's the exact identity-corruption class
+                # the patch was meant to eliminate. R2 fix: skip the frame
+                # with a warning + counter. Empty masks for one frame are
+                # always safer than wrong identity.
+                if frame_obj_ids is not None:
+                    local_to_global = []
+                    for local_idx, sam3_id in enumerate(frame_obj_ids):
+                        sam3_id = int(sam3_id)
+                        global_ch = obj_id_to_channel.get(sam3_id)
+                        if global_ch is None:
+                            # Should not happen — first pass collected all ids.
+                            continue
+                        local_to_global.append((local_idx, global_ch))
+                elif any_real_ids:
+                    # Mixed-mode frame in real-id mode — refuse to guess identity.
+                    inconsistent_metadata_frames += 1
+                    print(
+                        f"[SAM3 MaskTracks] WARN: Frame {frame_idx} has no "
+                        f"obj_ids metadata but other frames do — skipping "
+                        f"this frame to avoid silent identity corruption. "
+                        f"Producer should emit consistent metadata across all "
+                        f"frames. (inconsistent so far: "
+                        f"{inconsistent_metadata_frames})"
+                    )
+                    continue
+                else:
+                    # Pure legacy mode (no frame has real ids) — positional map.
+                    local_to_global = [(i, i) for i in range(num_objects)]
 
                 if frame_mask.dim() == 3:
-                    # Multi-object mask [N_obj, H, W]
-                    for oid in range(min(frame_mask.shape[0], num_objects)):
-                        obj_mask = frame_mask[oid].float()
+                    # Multi-object mask [N_local, H, W]
+                    n_local = frame_mask.shape[0]
+                    for local_idx, global_ch in local_to_global:
+                        if local_idx >= n_local:
+                            continue
+                        obj_mask = frame_mask[local_idx].float()
 
                         # Normalize to [0, 1] if needed
                         if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
@@ -173,16 +289,16 @@ class SAM3MaskTracks:
                                 align_corners=False
                             ).squeeze(0).squeeze(0)
 
-                        all_masks[frame_idx, oid] = obj_mask
+                        all_masks[frame_idx, global_ch] = obj_mask
 
-                        # Track visibility
+                        # Track visibility (keyed by stable global channel)
                         pixel_count = (obj_mask > 0.5).sum().item()
                         if pixel_count >= min_visible_pixels:
-                            if object_info[oid]["first_frame"] is None:
-                                object_info[oid]["first_frame"] = frame_idx
-                            object_info[oid]["last_frame"] = frame_idx
-                            object_info[oid]["visible_frames"] += 1
-                            object_info[oid]["total_pixels"] += pixel_count
+                            if object_info[global_ch]["first_frame"] is None:
+                                object_info[global_ch]["first_frame"] = frame_idx
+                            object_info[global_ch]["last_frame"] = frame_idx
+                            object_info[global_ch]["visible_frames"] += 1
+                            object_info[global_ch]["total_pixels"] += pixel_count
 
                             # Compute bounding box if enabled
                             if output_bboxes:
@@ -192,12 +308,14 @@ class SAM3MaskTracks:
                                     y1 = max(0, ys.min().item() - bbox_padding)
                                     x2 = min(w, xs.max().item() + 1 + bbox_padding)
                                     y2 = min(h, ys.max().item() + 1 + bbox_padding)
-                                    object_info[oid]["bboxes"][frame_idx] = [x1, y1, x2, y2]
+                                    object_info[global_ch]["bboxes"][frame_idx] = [x1, y1, x2, y2]
                                     # Fill bbox mask
-                                    bbox_masks[frame_idx, oid, y1:y2, x1:x2] = 1.0
+                                    bbox_masks[frame_idx, global_ch, y1:y2, x1:x2] = 1.0
 
                 elif frame_mask.dim() == 2:
-                    # Single mask [H, W]
+                    # Single mask [H, W]. Target channel resolved below from
+                    # local_to_global[0] when obj_ids carried in input;
+                    # otherwise channel 0 (legacy mode).
                     obj_mask = frame_mask.float()
                     if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
                         obj_mask = obj_mask / 255.0
@@ -210,15 +328,21 @@ class SAM3MaskTracks:
                             align_corners=False
                         ).squeeze(0).squeeze(0)
 
-                    all_masks[frame_idx, 0] = obj_mask
+                    # Resolve target channel — if frame_obj_ids has exactly one
+                    # id, use its global mapping; otherwise channel 0.
+                    if local_to_global:
+                        target_ch = local_to_global[0][1]
+                    else:
+                        target_ch = 0
+                    all_masks[frame_idx, target_ch] = obj_mask
 
                     pixel_count = (obj_mask > 0.5).sum().item()
                     if pixel_count >= min_visible_pixels:
-                        if object_info[0]["first_frame"] is None:
-                            object_info[0]["first_frame"] = frame_idx
-                        object_info[0]["last_frame"] = frame_idx
-                        object_info[0]["visible_frames"] += 1
-                        object_info[0]["total_pixels"] += pixel_count
+                        if object_info[target_ch]["first_frame"] is None:
+                            object_info[target_ch]["first_frame"] = frame_idx
+                        object_info[target_ch]["last_frame"] = frame_idx
+                        object_info[target_ch]["visible_frames"] += 1
+                        object_info[target_ch]["total_pixels"] += pixel_count
 
                         # Compute bounding box if enabled
                         if output_bboxes:
@@ -228,34 +352,62 @@ class SAM3MaskTracks:
                                 y1 = max(0, ys.min().item() - bbox_padding)
                                 x2 = min(w, xs.max().item() + 1 + bbox_padding)
                                 y2 = min(h, ys.max().item() + 1 + bbox_padding)
-                                object_info[0]["bboxes"][frame_idx] = [x1, y1, x2, y2]
+                                object_info[target_ch]["bboxes"][frame_idx] = [x1, y1, x2, y2]
                                 # Fill bbox mask
-                                bbox_masks[frame_idx, 0, y1:y2, x1:x2] = 1.0
+                                bbox_masks[frame_idx, target_ch, y1:y2, x1:x2] = 1.0
 
-            # Collect scores if available
+            # Collect scores if available — map score index using same
+            # per-frame obj_ids when present, else legacy positional alignment.
             if scores is not None and frame_idx in scores:
                 frame_scores = scores[frame_idx]
                 if hasattr(frame_scores, 'tolist'):
                     score_list = frame_scores.tolist()
                     if score_list and isinstance(score_list[0], list):
                         score_list = score_list[0]
-                    for oid, score in enumerate(score_list):
-                        if oid < num_objects:
-                            object_info[oid]["scores"].append(score)
+                    # Re-fetch obj_ids for score alignment (mask path above may
+                    # not have run if frame_idx not in masks but is in scores).
+                    _, score_obj_ids = (
+                        get_mask_data(masks[frame_idx])
+                        if frame_idx in masks else (None, None)
+                    )
+                    if score_obj_ids is not None:
+                        for local_idx, score in enumerate(score_list):
+                            if local_idx >= len(score_obj_ids):
+                                break
+                            sam3_id = int(score_obj_ids[local_idx])
+                            global_ch = obj_id_to_channel.get(sam3_id)
+                            if global_ch is not None:
+                                object_info[global_ch]["scores"].append(score)
+                    elif not any_real_ids:
+                        # Pure legacy mode — positional alignment is safe.
+                        for ch, score in enumerate(score_list):
+                            if ch < num_objects:
+                                object_info[ch]["scores"].append(score)
+                    # else: real-id mode but this frame's scores have no obj_ids
+                    # metadata — skip rather than positional-map. Mirrors the
+                    # mixed-mode mask safety contract. Drops the scores but does
+                    # not corrupt avg_score by mis-attributing scores to wrong
+                    # channels. (R3 follow-up flagged by both Codex + Gemini.)
 
         # Compute average scores
-        for oid in range(num_objects):
-            if object_info[oid]["scores"]:
-                object_info[oid]["avg_score"] = sum(object_info[oid]["scores"]) / len(object_info[oid]["scores"])
+        for ch in range(num_objects):
+            if object_info[ch]["scores"]:
+                object_info[ch]["avg_score"] = sum(object_info[ch]["scores"]) / len(object_info[ch]["scores"])
             else:
-                object_info[oid]["avg_score"] = None
+                object_info[ch]["avg_score"] = None
 
-        # Build track_info JSON
+        # Build track_info JSON.
+        # `id` stays as channel index for back-compat with existing
+        # NV_SAM3SelectMask object_ids string ("0,1,2"). NEW: `sam3_obj_id`
+        # exposes the real SAM3 object id so callers can introspect the
+        # channel-to-identity mapping (and a future SelectMask widget can
+        # accept obj_id semantics without breaking saved workflows).
         objects_list = []
-        for oid, info in object_info.items():
+        for ch, info in object_info.items():
             if info["first_frame"] is not None:
                 obj_entry = {
-                    "id": oid,
+                    "id": ch,
+                    "sam3_obj_id": info["sam3_obj_id"],
                     "first_frame": info["first_frame"],
                     "last_frame": info["last_frame"],
                     "visible_frames": info["visible_frames"],
@@ -272,13 +424,27 @@ class SAM3MaskTracks:
             "total_objects": num_objects,
             "dimensions": {"height": h, "width": w},
             "bbox_output_enabled": output_bboxes,
+            # NEW: explicit channel-to-obj_id table — helps debug downstream
+            # SelectMask usage and confirms the audit fix is in effect.
+            "obj_id_mapping": {
+                str(ch): global_obj_ids[ch] for ch in range(num_objects)
+            },
+            "id_source": "sam3_obj_ids" if any_real_ids else "legacy_channel_index",
+            # R2 diagnostic: count of frames skipped due to missing obj_ids
+            # metadata while running in real-id mode. Non-zero means the
+            # producer is emitting inconsistent metadata across frames.
+            "inconsistent_metadata_frames": inconsistent_metadata_frames,
         }
 
-        # Print summary
+        # Print summary — surface the obj_id mapping so users can confirm.
         for obj in track_info["objects"]:
             score_str = f", avg_score={obj['avg_score']:.3f}" if obj['avg_score'] else ""
             bbox_str = f", {len(obj.get('bboxes', {}))} bboxes" if output_bboxes else ""
-            print(f"[SAM3 MaskTracks]   Object {obj['id']}: frames {obj['first_frame']}-{obj['last_frame']} ({obj['visible_frames']} visible){score_str}{bbox_str}")
+            print(
+                f"[SAM3 MaskTracks]   Channel {obj['id']} (SAM3 obj_id={obj['sam3_obj_id']}): "
+                f"frames {obj['first_frame']}-{obj['last_frame']} "
+                f"({obj['visible_frames']} visible){score_str}{bbox_str}"
+            )
 
         # If bbox output not enabled, return all_masks as bbox_masks (identity)
         if bbox_masks is None:

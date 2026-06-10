@@ -49,7 +49,7 @@ def apply_node_layer_compat(predictor):
         notes.append("start_session kwarg-filter")
     if _patch_add_new_mask_guard(predictor):
         notes.append("add_new_mask guard")
-    print(f"{_PREFIX} applied: {', '.join(notes) if notes else '(nothing — already compatible?)'}")
+    print(f"{_PREFIX} applied: {', '.join(notes) if notes else '(nothing - already compatible?)'}")
     return predictor
 
 
@@ -62,7 +62,7 @@ def _alias_session_registry(predictor) -> bool:
 
 def _patch_start_session(predictor) -> bool:
     if not hasattr(predictor, "model") or not hasattr(predictor.model, "init_state"):
-        print(f"{_PREFIX} WARN: predictor.model.init_state missing — cannot patch start_session.")
+        print(f"{_PREFIX} WARN: predictor.model.init_state missing - cannot patch start_session.")
         return False
 
     def start_session(self, resource_path, session_id=None,

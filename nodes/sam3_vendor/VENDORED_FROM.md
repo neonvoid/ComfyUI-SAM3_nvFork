@@ -81,16 +81,24 @@ diff bisection — do not repeat that.
          add_prompt/propagate filtering + fork-3.0 behavior of stashing
          offload_state_to_cpu on the state). Fixes
          `init_state() got an unexpected keyword argument 'offload_state_to_cpu'`.
-- KNOWN DEFERRED GAPS (not on the text/point smoke path; fix when hit):
-  1. `add_new_mask` — upstream Sam3BasePredictor does NOT expose it; the fork's
-     reconstructor calls it for MASK-type prompts (chunked video continuation).
-     Needs a multiplex mask-add path before chunked/mask-seeded workflows run.
-  2. `_apply_config` config knobs: `score_threshold_detection`, `assoc_iou_thresh`,
-     `det_nms_thresh`, `init_trk_keep_alive` appear renamed/relocated on the
-     multiplex tracking model — setting them is harmless (no crash) but becomes a
-     no-op, so those tuning levers don't bite on 3.1 yet. Reconcile names for
-     quality tuning. Builder defaults (score_threshold_detection=0.4 etc.) govern
-     meanwhile.
+  - `sam3_v31_compat.py` shim 3: **add_new_mask adapter** (added 2026-06-10).
+    Reconstructor calls singular `model.add_new_mask(session_id, frame_idx,
+    obj_id, mask)` for MASK-type prompts; multiplex exposes only batched
+    `add_new_masks(inference_state, frame_idx, obj_ids[list], masks[N,H,W])`.
+    Adapter normalizes mask -> [1,H,W], calls batched under bf16 autocast,
+    creates the object (reconditioning=False). Per SAM3 mutual-exclusion, this
+    pops point inputs for that (frame,obj) — mask and points are alternatives,
+    not additive. Legible-error fallback if a future snapshot lacks add_new_masks.
+    Unit-tested (shaping + dispatch + fallback); RUNTIME-VALIDATION still owed on
+    a real chunked/mask-seeded workflow.
+- STATIC-TRACE RESULT (2026-06-10): exhaustive audit of the whole video path
+  found the text/point/box smoke path FULLY COMPATIBLE after the shims —
+  add_prompt/propagate/handle_stream_request match; output keys
+  out_binary_masks/out_obj_ids/out_probs ARE emitted (normal + empty-frame
+  paths) so masks flow; the 11 `_apply_config` knobs are present AND read at
+  runtime (hotstart_delay/score_threshold_detection/new_det_thresh confirmed
+  consumed in multiplex code) — so UI tuning DOES apply (earlier "no-op" worry
+  was wrong). No remaining static crashes on any path.
 - Import smoke PASSED on Windows embedded python (no triton, no flash-attn):
   package import + multiplex predictor + builder + Sam3Processor.
 - Recovered legacy fixes: NOT yet ported beyond edt.py (see

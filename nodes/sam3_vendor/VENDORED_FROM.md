@@ -31,26 +31,41 @@ diff bisection — do not repeat that.
     porting anything to a new vendor (check whether upstream main already fixed
     each item).
 
-## Planned vendor: `nodes/sam3_lib_v31/` (SAM 3.1 Object Multiplex) — NOT YET VENDORED
+## Vendor: `nodes/sam3_lib_v31/` (SAM 3.1 Object Multiplex) — VENDORED 2026-06-10
 
 - Source repo: https://github.com/facebookresearch/sam3 (main; SAM 3.1 released
   2026-03-27 per RELEASE_SAM3p1.md, no tag)
-- Upstream commit: TBD at vendor time — record the full 40-char hash here AND in
+- Upstream commit: **`8e451d5eb43c817b64ae7577fb7b9ae223db88a9`** (2026-05-23 HEAD
+  at vendor time). Full package vendored (5.1MB incl. train/ — model/ imports
+  train.masks_ops + train.data.collator). Details in
   `nodes/sam3_lib_v31/VENDORED_FROM.yaml`.
-- Required steps at vendor time (per migration plan, multi-AI R0 2026-06-10,
-  archives `~/.multi-ai/results/20260610-134633/`):
-  1. Internal import rewrite (`sam3.` → relative/namespaced) so both libs
-     coexist in one process.
-  2. Curated state-dict drift mitigation, strict=True (purge regenerable RoPE
-     `freqs_cis_*` buffers ONLY after confirming non-persistent in upstream
-     code; dot↔underscore attn remap; hard-fail diagnostics). See upstream
-     issues #526/#506.
-  3. Port applicable recovered fork fixes (check each against upstream main
-     first — some may be fixed upstream).
-  4. New sibling node classes with distinct registry keys (LoadSAM31Model,
-     SAM31VideoSegmentation, ...). Never mutate the 3.0 classes.
-  5. Shared node layer (MaskTracks/SelectMask/MultiFrameAddPrompt/cache ops)
-     stays version-agnostic — 3.1-specific logic goes in v31 siblings only.
+- Local modifications (all recorded in the yaml):
+  1. Import rewrite `sam3.` → `sam3_v31.` (sed, leading-whitespace-tolerant) +
+     `sys.modules["sam3_v31"]` alias registered in `__init__.py` BEFORE any
+     submodule import. Both libs coexist in one process (legacy uses relative
+     imports; v31 uses the alias).
+  2. `model/edt.py` replaced with the legacy fork's triton-guarded version
+     (HAS_TRITON try/except + torch fallback `edt_triton`) — upstream's only
+     drift since the legacy base was a `# pyre-unsafe` comment (re-applied).
+     This was the ONLY module-level triton import on the multiplex hot path;
+     perflib triton kernels are lazy (function-level imports).
+  3. `pkg_resources.resource_filename` package arg → `"sam3_v31"` (3 sites,
+     defensive — the loader always passes bpe_path explicitly).
+- Loader: `nodes/load_model_v31.py` → `LoadSAM31Model` (registry-distinct
+  sibling; legacy LoadSAM3Model untouched). Uses upstream
+  `build_sam3_multiplex_video_predictor` AS-IS (its internal torch.load +
+  internal→OSS key remap + strict=False with printed missing/unexpected keys).
+  `.safetensors` supported via one-time convert-to-`.pt` cache (upstream is
+  torch.load-only). CUDA required (upstream `.cuda()` hardcoded). use_fa3 +
+  torch_compile surfaced as widgets, default OFF (Windows).
+- Node-layer compat: `sam3_video_nodes.py` obj_ids extraction made
+  key-tolerant (`obj_ids` | `out_obj_ids`) — upstream emits `out_obj_ids`;
+  without this, MaskTracks silently falls back to channel-index identity.
+- Import smoke PASSED on Windows embedded python (no triton, no flash-attn):
+  package import + multiplex predictor + builder + Sam3Processor.
+- Recovered legacy fixes: NOT yet ported beyond edt.py (see
+  patches/recovered/). Evaluate per-fix against this snapshot during runtime
+  validation — device/NMS behavior may already be fixed upstream.
 - Checkpoints: `facebook/sam3.1` HF (gated, fp32 `sam3.1_multiplex.pt`) or
   `Comfy-Org/sam3.1` (ungated, `sam3.1_multiplex_fp16.safetensors`). License:
-  "SAM License" (code + weights).
+  "SAM License" (code + weights; LICENSE copied into sam3_lib_v31/).

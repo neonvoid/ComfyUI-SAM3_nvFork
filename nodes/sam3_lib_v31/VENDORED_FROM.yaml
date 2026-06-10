@@ -1,0 +1,13 @@
+upstream_repo: "https://github.com/facebookresearch/sam3"
+commit_hash: "8e451d5eb43c817b64ae7577fb7b9ae223db88a9"
+commit_date: "2026-05-23"
+vendor_date: "2026-06-10"
+version_label: "sam3.1-multiplex"
+sam31_release_commit_context: "SAM 3.1 Object Multiplex released 2026-03-27 (RELEASE_SAM3p1.md); this snapshot is HEAD of main at vendor time"
+license: "SAM License (see LICENSE in this directory)"
+local_modifications:
+  - "import rewrite: all `sam3.` absolute imports -> `sam3_v31.` (coexistence with frozen nodes/sam3_lib); sys.modules alias registered in __init__.py"
+  - "pkg_resources.resource_filename package arg 'sam3' -> 'sam3_v31' (3 sites in model_builder.py; defensive only — loader always passes bpe_path)"
+  - "__init__.py rewritten: alias registration + multiplex builder exports"
+recovered_legacy_fixes_ported: []  # NONE yet — evaluate nodes/sam3_vendor/patches/recovered/ against this snapshot before porting (some may be fixed upstream)
+excluded: []  # full upstream sam3/ package vendored (5.1MB incl. train/ — model/ imports train.masks_ops + train.data.collator)

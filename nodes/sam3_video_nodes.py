@@ -1967,17 +1967,24 @@ class SAM3Propagate:
                                 mask = mask.cpu()
                             del outputs[mask_key]
 
-                            # Capture object IDs for stable color mapping
+                            # Capture object IDs for stable color mapping.
+                            # Key tolerance: legacy fork wrapper emits "obj_ids";
+                            # upstream SAM 3.1 predictors emit "out_obj_ids".
                             frame_obj_ids = None
-                            if "obj_ids" in outputs and outputs["obj_ids"] is not None:
-                                ids = outputs["obj_ids"]
+                            obj_ids_key = None
+                            for key in ["obj_ids", "out_obj_ids"]:
+                                if key in outputs and outputs[key] is not None:
+                                    obj_ids_key = key
+                                    break
+                            if obj_ids_key is not None:
+                                ids = outputs[obj_ids_key]
                                 if hasattr(ids, 'tolist'):
                                     ids = ids.tolist()
                                 elif isinstance(ids, np.ndarray):
                                     ids = ids.tolist()
                                 frame_obj_ids = ids
                                 obj_ids_dict[frame_idx] = ids
-                                del outputs["obj_ids"]
+                                del outputs[obj_ids_key]
 
                             # --- ID stability correction ---
                             # Remap IDs when initial objects disappear and new IDs appear in similar positions

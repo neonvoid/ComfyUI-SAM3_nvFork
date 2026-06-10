@@ -289,13 +289,14 @@ class SAM3MaskTracks:
                 }),
                 "subject_map": ("STRING", {
                     "default": "",
-                    "forceInput": True,
+                    "multiline": True,
                     "tooltip": (
-                        "Optional subject_map JSON from NV_SAM3SeedBuilder, e.g. "
-                        '{"subjects":[{"obj_id":1,"name":"head"},{"obj_id":2,"name":"body"}]}. '
-                        "Embeds name<->obj_id tables into track_info (v2) so downstream "
-                        "NV_SAM3SelectMask / NV_SAM3MaskRouter can select masks by NAME "
-                        "instead of integer obj_id. Leave unwired for legacy integer use."
+                        "Optional subject_map JSON (wire from NV_SAM3SeedBuilder, or "
+                        'paste for testing), e.g. {"subjects":[{"obj_id":1,"name":"head"},'
+                        '{"obj_id":2,"name":"body"}]}. Embeds name<->obj_id tables into '
+                        "track_info (v2) so downstream NV_SAM3SelectMask / NV_SAM3MaskRouter "
+                        "can select masks by NAME instead of integer obj_id. Leave blank "
+                        "for legacy integer use."
                     ),
                 }),
             }

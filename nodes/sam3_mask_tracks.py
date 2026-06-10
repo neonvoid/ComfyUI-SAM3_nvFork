@@ -18,6 +18,230 @@ from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
 
+def _parse_subject_map(raw, global_obj_ids):
+    """Parse a subject_map payload (from NV_SAM3SeedBuilder) into the
+    name<->obj_id tables embedded in track_info v2.
+
+    The downstream resolver needs BOTH name->obj_id (declared upstream) AND
+    obj_id->channel (only MaskTracks knows). This embeds the former into
+    track_info so NV_SAM3SelectMask / NV_SAM3MaskRouter can select by NAME
+    without the operator ever inspecting an integer obj_id.
+
+    Accepts, defensively (a malformed map must NOT crash a render):
+      - "" / None                                   -> no map
+      - {"subjects": [{"obj_id": 1, "name": "head"}, ...]}  (SeedBuilder form)
+      - [{"obj_id": 1, "name": "head"}, ...]               (bare subjects list)
+      - {"1": "head", "2": "body"}                         (plain obj_id->name)
+
+    `global_obj_ids` is the list of SAM3 obj_ids actually tracked this run;
+    used to split declared subjects into present/missing for diagnostics.
+
+    Returns dict {obj_id_to_name, name_to_obj_id, present, missing, warnings}
+    or None when no usable map is supplied.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        if not raw.strip():
+            return None
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as e:
+            return {
+                "obj_id_to_name": {}, "name_to_obj_id": {},
+                "present": [], "missing": [],
+                "warnings": [f"subject_map not valid JSON, ignored: {e}"],
+            }
+
+    # Normalize to an iterable of (obj_id, name) candidate pairs.
+    pairs = []
+    if isinstance(raw, dict) and "subjects" in raw:
+        subjects = raw.get("subjects")
+        if isinstance(subjects, list):
+            for item in subjects:
+                if isinstance(item, dict):
+                    pairs.append((item.get("obj_id"), item.get("name")))
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                pairs.append((item.get("obj_id"), item.get("name")))
+    elif isinstance(raw, dict):
+        # plain {obj_id: name}
+        for k, v in raw.items():
+            pairs.append((k, v))
+    else:
+        return {
+            "obj_id_to_name": {}, "name_to_obj_id": {},
+            "present": [], "missing": [],
+            "warnings": [f"subject_map unrecognized shape {type(raw).__name__}, ignored"],
+        }
+
+    obj_id_to_name: Dict[int, str] = {}
+    name_to_obj_id: Dict[str, int] = {}
+    warnings: List[str] = []
+    for rid, rname in pairs:
+        # obj_id must be a non-bool integer-coercible value.
+        if isinstance(rid, bool) or isinstance(rname, bool):
+            warnings.append(f"subject entry with bool field skipped: ({rid!r}, {rname!r})")
+            continue
+        try:
+            oid = int(rid)
+        except (TypeError, ValueError):
+            warnings.append(f"subject obj_id not integer-coercible, skipped: {rid!r}")
+            continue
+        name = "" if rname is None else str(rname).strip()
+        if not name:
+            warnings.append(f"subject obj_id={oid} has blank name, skipped")
+            continue
+        if oid in obj_id_to_name:
+            warnings.append(
+                f"duplicate obj_id={oid} in subject_map "
+                f"({obj_id_to_name[oid]!r} kept, {name!r} dropped)"
+            )
+            continue
+        if name in name_to_obj_id:
+            warnings.append(
+                f"duplicate name={name!r} in subject_map "
+                f"(obj_id={name_to_obj_id[name]} kept, obj_id={oid} dropped)"
+            )
+            continue
+        obj_id_to_name[oid] = name
+        name_to_obj_id[name] = oid
+
+    tracked = set(int(o) for o in global_obj_ids)
+    present = [obj_id_to_name[o] for o in obj_id_to_name if o in tracked]
+    missing = [obj_id_to_name[o] for o in obj_id_to_name if o not in tracked]
+    return {
+        "obj_id_to_name": obj_id_to_name,
+        "name_to_obj_id": name_to_obj_id,
+        "present": present,
+        "missing": missing,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared name->obj_id->channel resolver (track_info v2)
+# Used by NV_SAM3SelectMask (name mode) + NV_SAM3MaskRouter. Single source of
+# truth so the two nodes can never drift on resolution semantics.
+# ---------------------------------------------------------------------------
+
+def _load_track_info(track_info):
+    """Accept track_info as a dict or JSON string; return a dict ({} on failure)."""
+    if isinstance(track_info, dict):
+        return track_info
+    if isinstance(track_info, str) and track_info.strip():
+        try:
+            obj = json.loads(track_info)
+            return obj if isinstance(obj, dict) else {}
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return {}
+
+
+def _normalize_subject_name(s):
+    """casefold + collapse internal whitespace, for the unique-normalized fallback."""
+    return " ".join(str(s).strip().casefold().split())
+
+
+def _subject_to_obj_id_table(info):
+    """name->obj_id table from track_info; derive from subject_map if the
+    explicit subject_to_obj_id table is absent."""
+    table = info.get("subject_to_obj_id")
+    if isinstance(table, dict) and table:
+        out = {}
+        for k, v in table.items():
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+    sm = info.get("subject_map")  # obj_id -> name
+    if isinstance(sm, dict) and sm:
+        out = {}
+        for oid, name in sm.items():
+            try:
+                out[str(name)] = int(oid)
+            except (TypeError, ValueError):
+                continue
+        return out
+    return {}
+
+
+def resolve_subject_name(track_info, name):
+    """Resolve a subject NAME -> (obj_id, channel) from track_info v2 tables.
+
+    Policy (mask-router R1 design, 20260610-004124):
+      1. exact match on the name->obj_id table
+      2. else unique casefold+whitespace-normalized match
+      3. ambiguous normalized match -> ValueError (use the exact name)
+      4. resolved obj_id has no channel (declared upstream but SAM3 produced no
+         track) -> ValueError listing the AVAILABLE subjects, so the operator
+         fixes a typo / upstream miss WITHOUT ever inspecting an integer id.
+
+    `track_info` may be a dict or JSON string. Returns (obj_id:int, channel:int).
+    """
+    info = _load_track_info(track_info)
+    name_clean = str(name).strip()
+    if not name_clean:
+        raise ValueError("resolve_subject_name: empty subject name")
+
+    name_to_obj = _subject_to_obj_id_table(info)
+    if not name_to_obj:
+        raise ValueError(
+            "track_info carries no subject_map. Wire NV_SAM3SeedBuilder.subject_map "
+            "into NV_SAM3MaskTracks.subject_map so masks can be selected by name."
+        )
+
+    obj_id = name_to_obj.get(name_clean)
+    if obj_id is None:
+        target = _normalize_subject_name(name_clean)
+        hits = [(nm, oid) for nm, oid in name_to_obj.items()
+                if _normalize_subject_name(nm) == target]
+        if len(hits) == 1:
+            obj_id = hits[0][1]
+        elif len(hits) > 1:
+            raise ValueError(
+                f"Subject '{name_clean}' is ambiguous under case/space "
+                f"normalization: matches {[h[0] for h in hits]}. Use the exact name."
+            )
+        else:
+            available = sorted(name_to_obj.keys())
+            raise ValueError(
+                f"Subject '{name_clean}' was not found. Available subjects: "
+                f"{', '.join(available) if available else '(none)'}."
+            )
+
+    obj_id_to_channel = info.get("obj_id_to_channel") or {}
+    channel = obj_id_to_channel.get(str(obj_id))
+    if channel is None:
+        present = info.get("subjects_present")
+        avail = (sorted(present) if isinstance(present, list) and present
+                 else sorted(nm for nm, oid in name_to_obj.items()
+                             if str(oid) in obj_id_to_channel))
+        raise ValueError(
+            f"Subject '{name_clean}' resolved to obj_id {obj_id}, but that obj_id "
+            f"produced no mask track this run (SAM3 found nothing for it). "
+            f"Tracked subjects: {', '.join(avail) if avail else '(none)'}."
+        )
+    return int(obj_id), int(channel)
+
+
+def _parse_names_list(raw):
+    """Split a subject_names value (newline and/or comma separated) into a clean
+    ordered list with blanks dropped and duplicates removed (order preserved)."""
+    if not raw:
+        return []
+    seen = set()
+    out = []
+    for line in str(raw).replace(",", "\n").split("\n"):
+        s = line.strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 class SAM3MaskTracks:
     """
     Export all object masks as separate, ID-consistent tracks.
@@ -63,6 +287,17 @@ class SAM3MaskTracks:
                     "step": 1,
                     "tooltip": "Padding (in pixels) to add around bounding boxes"
                 }),
+                "subject_map": ("STRING", {
+                    "default": "",
+                    "forceInput": True,
+                    "tooltip": (
+                        "Optional subject_map JSON from NV_SAM3SeedBuilder, e.g. "
+                        '{"subjects":[{"obj_id":1,"name":"head"},{"obj_id":2,"name":"body"}]}. '
+                        "Embeds name<->obj_id tables into track_info (v2) so downstream "
+                        "NV_SAM3SelectMask / NV_SAM3MaskRouter can select masks by NAME "
+                        "instead of integer obj_id. Leave unwired for legacy integer use."
+                    ),
+                }),
             }
         }
 
@@ -71,7 +306,7 @@ class SAM3MaskTracks:
     FUNCTION = "extract_tracks"
     CATEGORY = "SAM3/video"
 
-    def extract_tracks(self, masks, video_state, scores=None, min_visible_pixels=100, output_bboxes=False, bbox_padding=0):
+    def extract_tracks(self, masks, video_state, scores=None, min_visible_pixels=100, output_bboxes=False, bbox_padding=0, subject_map=None):
         """
         Extract all object masks into a single [N_frames, N_objects, H, W] tensor.
 
@@ -156,6 +391,35 @@ class SAM3MaskTracks:
         obj_id_to_channel = {oid: idx for idx, oid in enumerate(global_obj_ids)}
         num_objects = len(global_obj_ids)
 
+        # --- track_info v2: name<->obj_id + obj_id<->channel tables ---
+        # Both halves of the name-addressed pipeline (NV_SAM3SelectMask name
+        # mode + NV_SAM3MaskRouter) resolve name -> obj_id -> channel from
+        # track_info alone. obj_id<->channel is known only here; name<->obj_id
+        # comes from the optional subject_map (NV_SAM3SeedBuilder). All keys are
+        # additive — existing consumers of `objects`/`obj_id_mapping` unaffected.
+        v2_block = {
+            "version": "nv_sam3_mask_tracks.v2",
+            "obj_id_to_channel": {str(global_obj_ids[ch]): ch for ch in range(num_objects)},
+            "channel_to_obj_id": {str(ch): global_obj_ids[ch] for ch in range(num_objects)},
+        }
+        _sm = _parse_subject_map(subject_map, global_obj_ids)
+        v2_block["subject_map_source"] = "input" if _sm is not None else "none"
+        if _sm is not None:
+            v2_block["subject_map"] = {str(k): v for k, v in _sm["obj_id_to_name"].items()}
+            v2_block["subject_to_obj_id"] = dict(_sm["name_to_obj_id"])
+            v2_block["subjects_present"] = _sm["present"]
+            v2_block["subjects_missing"] = _sm["missing"]
+            if _sm["warnings"]:
+                v2_block["subject_map_warnings"] = _sm["warnings"]
+                for _w in _sm["warnings"]:
+                    print(f"[SAM3 MaskTracks] WARN subject_map: {_w}")
+            if _sm["missing"]:
+                print(
+                    f"[SAM3 MaskTracks] WARN: declared subjects with no tracked "
+                    f"obj_id this run: {_sm['missing']} -- selecting them by name "
+                    f"downstream will raise."
+                )
+
         if num_objects == 0:
             print("[SAM3 MaskTracks] No objects found in masks")
             empty_masks = torch.zeros(num_frames, 1, h, w)
@@ -163,6 +427,7 @@ class SAM3MaskTracks:
                 "objects": [],
                 "total_frames": num_frames,
                 "total_objects": 0,
+                **v2_block,
             }, indent=2)
             return (empty_masks, empty_masks, track_info, 0)
 
@@ -434,6 +699,8 @@ class SAM3MaskTracks:
             # metadata while running in real-id mode. Non-zero means the
             # producer is emitting inconsistent metadata across frames.
             "inconsistent_metadata_frames": inconsistent_metadata_frames,
+            # track_info v2: obj_id<->channel + (optional) name<->obj_id tables.
+            **v2_block,
         }
 
         # Print summary — surface the obj_id mapping so users can confirm.
@@ -510,6 +777,43 @@ class SAM3SelectMask:
                     "default": "",
                     "tooltip": "Custom mask colors (comma-separated). Names: red, blue, green, yellow, magenta, cyan, orange, purple, pink, lime, teal, coral, gold, navy. Or hex: #FF0000. Order matches object IDs. Empty = default colors."
                 }),
+                # --- name-addressed selection (appended for back-compat; never
+                # reorder the widgets above — widgets_values is positional) ---
+                "select_by": (["id", "name"], {
+                    "default": "id",
+                    "tooltip": (
+                        "id = select by integer channel (legacy, unchanged). "
+                        "name = select by subject name from upstream "
+                        "NV_SAM3SeedBuilder; requires track_info wired. In name "
+                        "mode, object_ids is ignored."
+                    ),
+                }),
+                "subject_names": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": (
+                        "Subject name(s) to select, one per line or comma-"
+                        "separated (e.g. 'head' or 'head, hair'). Only used when "
+                        "select_by=name. Names come from the subjects list "
+                        "declared far upstream -- no integer ids to look up."
+                    ),
+                }),
+                "missing_name_policy": (["error", "empty_warn"], {
+                    "default": "error",
+                    "tooltip": (
+                        "name mode: error = raise if a requested name has no "
+                        "track (lists available subjects). empty_warn = skip it "
+                        "with a warning (empty mask if none resolve)."
+                    ),
+                }),
+                "track_info": ("STRING", {
+                    "default": "",
+                    "forceInput": True,
+                    "tooltip": (
+                        "track_info JSON from NV_SAM3MaskTracks. Required for "
+                        "select_by=name (carries the name<->obj_id<->channel tables)."
+                    ),
+                }),
             }
         }
 
@@ -561,9 +865,14 @@ class SAM3SelectMask:
 
         return torch.stack(vis_list, dim=0)
 
-    def select(self, all_masks, object_ids="all", video_frames=None, combine_mode="union", viz_alpha=0.5, mask_colors=""):
+    def select(self, all_masks, object_ids="all", video_frames=None, combine_mode="union", viz_alpha=0.5, mask_colors="",
+               select_by="id", subject_names="", missing_name_policy="error", track_info=""):
         """
         Select and optionally combine object masks.
+
+        select_by="id" (default): legacy integer-channel selection via object_ids.
+        select_by="name": resolve subject_names -> obj_id -> channel from
+        track_info (v2). object_ids is ignored in name mode.
         """
         # Handle different input shapes
         if all_masks.dim() == 3:
@@ -583,22 +892,58 @@ class SAM3SelectMask:
         num_frames, num_objects, h, w = all_masks.shape
         print(f"[SAM3 SelectMask] Input: {num_frames} frames, {num_objects} objects")
 
-        # Parse object_ids
-        object_ids_str = object_ids.strip().lower()
-        if object_ids_str == "all":
-            ids = list(range(num_objects))
+        if select_by == "name":
+            # Resolve subject names -> channels via track_info v2 tables.
+            # object_ids is intentionally ignored here.
+            names = _parse_names_list(subject_names)
+            if not names:
+                raise ValueError(
+                    "[SAM3 SelectMask] select_by=name but subject_names is empty. "
+                    "Enter one subject name per line (e.g. 'head')."
+                )
+            info = _load_track_info(track_info)
+            if not info:
+                raise ValueError(
+                    "[SAM3 SelectMask] select_by=name requires track_info from "
+                    "NV_SAM3MaskTracks. Wire its track_info output into this node."
+                )
+            valid_ids = []
+            for nm in names:
+                try:
+                    _oid, ch = resolve_subject_name(info, nm)
+                except ValueError as e:
+                    if missing_name_policy == "empty_warn":
+                        print(f"[SAM3 SelectMask] WARN (empty_warn): {e}")
+                        continue
+                    raise
+                # Stale-mismatch guard: track_info channel must index this tensor.
+                if ch >= num_objects:
+                    raise ValueError(
+                        f"[SAM3 SelectMask] Subject '{nm}' maps to channel {ch} but "
+                        f"all_masks has only {num_objects} channels. track_info and "
+                        f"all_masks are from different runs -- re-wire both from the "
+                        f"SAME NV_SAM3MaskTracks."
+                    )
+                if ch not in valid_ids:
+                    valid_ids.append(ch)
+            print(f"[SAM3 SelectMask] name mode: {names} -> channels {valid_ids}")
         else:
-            try:
-                ids = [int(x.strip()) for x in object_ids.split(",") if x.strip()]
-            except ValueError:
-                print(f"[SAM3 SelectMask] Warning: Could not parse '{object_ids}', using all objects")
+            # Parse object_ids (legacy integer-channel path, unchanged)
+            object_ids_str = object_ids.strip().lower()
+            if object_ids_str == "all":
                 ids = list(range(num_objects))
+            else:
+                try:
+                    ids = [int(x.strip()) for x in object_ids.split(",") if x.strip()]
+                except ValueError:
+                    print(f"[SAM3 SelectMask] Warning: Could not parse '{object_ids}', using all objects")
+                    ids = list(range(num_objects))
 
-        # Filter to valid IDs
-        valid_ids = [i for i in ids if 0 <= i < num_objects]
-        if not valid_ids:
-            print(f"[SAM3 SelectMask] Warning: No valid object IDs found, using object 0")
-            valid_ids = [0] if num_objects > 0 else []
+            # Filter to valid IDs
+            valid_ids = [i for i in ids if 0 <= i < num_objects]
+            if not valid_ids:
+                print(f"[SAM3 SelectMask] Warning: No valid object IDs found, using object 0")
+                valid_ids = [0] if num_objects > 0 else []
 
         print(f"[SAM3 SelectMask] Selecting objects: {valid_ids}, mode: {combine_mode}")
 
@@ -1397,10 +1742,149 @@ class SAM3VideoSegmenter:
         )
 
 
+class SAM3MaskRouter:
+    """Name-addressed fan-out: K fixed slots, each configured by a subject NAME.
+
+    Solves the repetitive-graph-fan-out problem that NV_SAM3SelectMask doesn't:
+    one node, fixed output lanes whose meaning is set by name widgets. The
+    operator types subject names they declared far upstream (NV_SAM3SeedBuilder)
+    -- never an integer obj_id, never an inspection of the segmentation output.
+
+    Per-slot semantics (mask-router R1 design, 20260610-004124):
+      - blank slot name      -> emit an all-zero mask, NOT included in
+                                names / masks_batch, no warning (intentionally unused)
+      - non-blank + resolves -> that subject's mask, included in names + batch
+      - non-blank + missing  -> missing_name_policy: error (raise, listing
+                                available subjects) | empty_warn (zero lane + warn,
+                                excluded from names/batch)
+
+    Each lane is [F,H,W] for all_frames, or [1,H,W] for the single-frame modes.
+    masks_batch is the resolved lanes concatenated subject-major along dim 0;
+    names is the newline-joined resolved subject names aligned to that batch.
+    """
+
+    NUM_SLOTS = 8
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        slots = {}
+        _defaults = ["head", "body", "hair", "", "", "", "", ""]
+        for i in range(cls.NUM_SLOTS):
+            slots[f"slot_{i+1}_name"] = ("STRING", {
+                "default": _defaults[i],
+                "tooltip": (
+                    f"Subject name routed to output slot {i+1}. Blank = unused "
+                    f"(emits an empty mask, excluded from names/masks_batch)."
+                ),
+            })
+        return {
+            "required": {
+                "mask_tracks": ("MASK", {
+                    "tooltip": "Multi-object mask tensor [F, N_obj, H, W] from NV_SAM3MaskTracks.",
+                }),
+                "track_info": ("STRING", {
+                    "default": "",
+                    "forceInput": True,
+                    "tooltip": "track_info JSON from NV_SAM3MaskTracks (name<->obj_id<->channel tables).",
+                }),
+                **slots,
+                "missing_name_policy": (["error", "empty_warn"], {
+                    "default": "error",
+                    "tooltip": (
+                        "A non-blank slot whose name has no track: error = raise "
+                        "(lists available subjects); empty_warn = emit zero lane + warn."
+                    ),
+                }),
+                "frame_mode": (["all_frames", "first_frame", "last_frame", "frame_index"], {
+                    "default": "all_frames",
+                    "tooltip": "Emit all frames, or a single frame per lane.",
+                }),
+                "frame_index": ("INT", {
+                    "default": 0, "min": 0, "max": 999999,
+                    "tooltip": "Frame to emit when frame_mode=frame_index.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = tuple(["MASK"] * NUM_SLOTS + ["STRING", "MASK"])
+    RETURN_NAMES = tuple([f"slot_{i+1}_mask" for i in range(NUM_SLOTS)] + ["names", "masks_batch"])
+    FUNCTION = "route_masks"
+    CATEGORY = "SAM3/video"
+
+    def route_masks(self, mask_tracks, track_info="", missing_name_policy="error",
+                    frame_mode="all_frames", frame_index=0, **slot_kwargs):
+        if mask_tracks.dim() != 4:
+            raise ValueError(
+                f"[SAM3 MaskRouter] Expected 4D mask_tracks [F, N_obj, H, W], "
+                f"got shape {tuple(mask_tracks.shape)}. Wire NV_SAM3MaskTracks.all_masks."
+            )
+        num_frames, num_objects, h, w = mask_tracks.shape
+        info = _load_track_info(track_info)
+
+        def _frame_slice(t):
+            # t is [F, H, W]; reduce to the configured frame window.
+            if frame_mode == "all_frames":
+                return t
+            if frame_mode == "first_frame":
+                return t[0:1]
+            if frame_mode == "last_frame":
+                return t[num_frames - 1:num_frames]
+            # frame_index
+            idx = max(0, min(frame_index, num_frames - 1))
+            return t[idx:idx + 1]
+
+        zero_lane = _frame_slice(torch.zeros(num_frames, h, w, device=mask_tracks.device))
+
+        lane_masks = []
+        resolved_names = []
+        resolved_lanes = []
+        for i in range(self.NUM_SLOTS):
+            nm = (slot_kwargs.get(f"slot_{i+1}_name") or "").strip()
+            if not nm:
+                lane_masks.append(zero_lane)
+                continue
+            if not info:
+                raise ValueError(
+                    f"[SAM3 MaskRouter] slot {i+1} requests '{nm}' but track_info "
+                    f"is empty. Wire NV_SAM3MaskTracks.track_info into this node."
+                )
+            try:
+                _oid, ch = resolve_subject_name(info, nm)
+            except ValueError as e:
+                if missing_name_policy == "empty_warn":
+                    print(f"[SAM3 MaskRouter] WARN (empty_warn) slot {i+1}: {e}")
+                    lane_masks.append(zero_lane)
+                    continue
+                raise ValueError(f"[SAM3 MaskRouter] slot {i+1}: {e}")
+            if ch >= num_objects:
+                raise ValueError(
+                    f"[SAM3 MaskRouter] slot {i+1} '{nm}' maps to channel {ch} but "
+                    f"mask_tracks has only {num_objects} channels. track_info and "
+                    f"mask_tracks are from different runs -- re-wire both from the "
+                    f"SAME NV_SAM3MaskTracks."
+                )
+            lane = _frame_slice(mask_tracks[:, ch])
+            lane_masks.append(lane)
+            resolved_names.append(nm)
+            resolved_lanes.append(lane)
+
+        if resolved_lanes:
+            masks_batch = torch.cat(resolved_lanes, dim=0)
+        else:
+            masks_batch = zero_lane  # nothing resolved -> single zero frame-window
+        names_str = "\n".join(resolved_names)
+        print(
+            f"[SAM3 MaskRouter] frame_mode={frame_mode} resolved {len(resolved_names)} "
+            f"lane(s): {resolved_names}; masks_batch {tuple(masks_batch.shape)}"
+        )
+        return tuple(lane_masks + [names_str, masks_batch])
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "NV_SAM3MaskTracks": SAM3MaskTracks,
     "NV_SAM3SelectMask": SAM3SelectMask,
+    "NV_SAM3MaskRouter": SAM3MaskRouter,
     "NV_SAM3BatchPlanner": SAM3BatchPlanner,
     "NV_SAM3VideoSegmenter": SAM3VideoSegmenter,
 }
@@ -1408,6 +1892,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_SAM3MaskTracks": "NV SAM3 Mask Tracks",
     "NV_SAM3SelectMask": "NV SAM3 Select Mask",
+    "NV_SAM3MaskRouter": "NV SAM3 Mask Router",
     "NV_SAM3BatchPlanner": "NV SAM3 Batch Planner",
     "NV_SAM3VideoSegmenter": "NV SAM3 Video Segmenter",
 }

@@ -470,5 +470,164 @@ def test_4d_input_with_batch_size_greater_than_one_raises():
         node.extract_tracks(masks=masks, video_state=state, min_visible_pixels=1)
 
 
+# ---------------------------------------------------------------------------
+# Test 10: track_info v2 — name<->obj_id + obj_id<->channel tables
+# (linchpin for NV_SAM3SelectMask name mode + NV_SAM3MaskRouter)
+# ---------------------------------------------------------------------------
+
+def _two_obj_masks(h, w):
+    """Frame with obj_ids [1, 2] → sorted global channels ch0=1, ch1=2."""
+    return {
+        0: {
+            "mask": torch.stack([
+                _make_mask(h, w, region=(0, 2, 0, 2)),
+                _make_mask(h, w, region=(2, 4, 2, 4)),
+            ], dim=0),
+            "obj_ids": [1, 2],
+        },
+    }
+
+
+def test_v2_always_emits_obj_id_channel_tables_without_subject_map():
+    """Even with no subject_map wired, track_info v2 carries the obj_id<->channel
+    tables + version + subject_map_source='none'. Back-compat keys still present.
+    """
+    h, w = 4, 4
+    state = FakeVideoState(num_frames=1, height=h, width=w)
+    node = SAM3MaskTracks()
+    _m, _b, track_info_json, _n = node.extract_tracks(
+        masks=_two_obj_masks(h, w), video_state=state, min_visible_pixels=1
+    )
+    info = json.loads(track_info_json)
+    assert info["version"] == "nv_sam3_mask_tracks.v2"
+    assert info["subject_map_source"] == "none"
+    assert info["obj_id_to_channel"] == {"1": 0, "2": 1}
+    assert info["channel_to_obj_id"] == {"0": 1, "1": 2}
+    # back-compat keys untouched
+    assert info["obj_id_mapping"] == {"0": 1, "1": 2}
+    assert "subject_map" not in info  # not emitted when unwired
+
+
+def test_v2_subject_map_seedbuilder_form_embeds_name_tables():
+    """SeedBuilder {"subjects":[{obj_id,name}]} form → subject_map +
+    subject_to_obj_id embedded; declared-and-tracked → subjects_present.
+    """
+    h, w = 4, 4
+    state = FakeVideoState(num_frames=1, height=h, width=w)
+    sm = json.dumps({"subjects": [
+        {"obj_id": 1, "name": "head"},
+        {"obj_id": 2, "name": "body"},
+    ]})
+    node = SAM3MaskTracks()
+    _m, _b, track_info_json, _n = node.extract_tracks(
+        masks=_two_obj_masks(h, w), video_state=state,
+        min_visible_pixels=1, subject_map=sm,
+    )
+    info = json.loads(track_info_json)
+    assert info["subject_map_source"] == "input"
+    assert info["subject_map"] == {"1": "head", "2": "body"}
+    assert info["subject_to_obj_id"] == {"head": 1, "body": 2}
+    assert sorted(info["subjects_present"]) == ["body", "head"]
+    assert info["subjects_missing"] == []
+    # Full name->obj_id->channel chain resolvable from track_info alone:
+    oid = info["subject_to_obj_id"]["body"]            # 2
+    ch = info["obj_id_to_channel"][str(oid)]           # 1
+    assert ch == 1
+
+
+def test_v2_subject_map_plain_dict_form_accepted():
+    """Plain {obj_id: name} dict form is also accepted."""
+    h, w = 4, 4
+    state = FakeVideoState(num_frames=1, height=h, width=w)
+    node = SAM3MaskTracks()
+    _m, _b, track_info_json, _n = node.extract_tracks(
+        masks=_two_obj_masks(h, w), video_state=state,
+        min_visible_pixels=1, subject_map=json.dumps({"1": "head", "2": "body"}),
+    )
+    info = json.loads(track_info_json)
+    assert info["subject_to_obj_id"] == {"head": 1, "body": 2}
+
+
+def test_v2_declared_subject_not_tracked_lands_in_missing():
+    """A subject declared upstream but never produced by SAM3 (obj_id 3 here)
+    must appear in subjects_missing, NOT subjects_present, so the downstream
+    resolver can raise a clear error instead of silently emitting zeros.
+    """
+    h, w = 4, 4
+    state = FakeVideoState(num_frames=1, height=h, width=w)
+    sm = json.dumps({"subjects": [
+        {"obj_id": 1, "name": "head"},
+        {"obj_id": 2, "name": "body"},
+        {"obj_id": 3, "name": "hair"},   # never tracked
+    ]})
+    node = SAM3MaskTracks()
+    _m, _b, track_info_json, _n = node.extract_tracks(
+        masks=_two_obj_masks(h, w), video_state=state,
+        min_visible_pixels=1, subject_map=sm,
+    )
+    info = json.loads(track_info_json)
+    assert "hair" in info["subjects_missing"]
+    assert "hair" not in info["subjects_present"]
+    # hair has no channel — resolver must not find one.
+    assert "3" not in info["obj_id_to_channel"]
+
+
+def test_v2_malformed_subject_map_json_does_not_crash_render():
+    """A malformed subject_map must be ignored with a warning, never crash —
+    the segmentation result is far more expensive than the name metadata.
+    """
+    h, w = 4, 4
+    state = FakeVideoState(num_frames=1, height=h, width=w)
+    node = SAM3MaskTracks()
+    _m, _b, track_info_json, num_objects = node.extract_tracks(
+        masks=_two_obj_masks(h, w), video_state=state,
+        min_visible_pixels=1, subject_map="{not valid json",
+    )
+    info = json.loads(track_info_json)
+    assert num_objects == 2  # render unaffected
+    # source is "input" (a map was supplied) but tables are empty + warned.
+    assert info["subject_map_source"] == "input"
+    assert info["subject_to_obj_id"] == {}
+    assert any("not valid JSON" in w for w in info.get("subject_map_warnings", []))
+
+
+def test_v2_duplicate_name_in_subject_map_is_warned_first_wins():
+    """Duplicate subject name → first obj_id kept, collision warned (the
+    resolver relies on a unique name->obj_id table)."""
+    h, w = 4, 4
+    state = FakeVideoState(num_frames=1, height=h, width=w)
+    sm = json.dumps({"subjects": [
+        {"obj_id": 1, "name": "head"},
+        {"obj_id": 2, "name": "head"},   # dup name
+    ]})
+    node = SAM3MaskTracks()
+    _m, _b, track_info_json, _n = node.extract_tracks(
+        masks=_two_obj_masks(h, w), video_state=state,
+        min_visible_pixels=1, subject_map=sm,
+    )
+    info = json.loads(track_info_json)
+    assert info["subject_to_obj_id"] == {"head": 1}  # first wins
+    assert any("duplicate name" in w for w in info.get("subject_map_warnings", []))
+
+
+def test_v2_empty_objects_path_still_emits_v2_keys():
+    """When SAM3 produced no tracks, the empty-return track_info must still
+    carry v2 keys (+ declared subjects as missing) so a downstream name select
+    fails with a helpful 'available subjects' message rather than KeyError.
+    """
+    state = FakeVideoState(num_frames=3, height=4, width=4)
+    sm = json.dumps({"subjects": [{"obj_id": 1, "name": "head"}]})
+    node = SAM3MaskTracks()
+    _m, _b, track_info_json, num_objects = node.extract_tracks(
+        masks={}, video_state=state, min_visible_pixels=1, subject_map=sm,
+    )
+    info = json.loads(track_info_json)
+    assert num_objects == 0
+    assert info["version"] == "nv_sam3_mask_tracks.v2"
+    assert info["obj_id_to_channel"] == {}
+    assert info["subject_to_obj_id"] == {"head": 1}
+    assert info["subjects_missing"] == ["head"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

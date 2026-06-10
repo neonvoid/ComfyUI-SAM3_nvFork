@@ -58,9 +58,30 @@ diff bisection — do not repeat that.
   `.safetensors` supported via one-time convert-to-`.pt` cache (upstream is
   torch.load-only). CUDA required (upstream `.cuda()` hardcoded). use_fa3 +
   torch_compile surfaced as widgets, default OFF (Windows).
-- Node-layer compat: `sam3_video_nodes.py` obj_ids extraction made
-  key-tolerant (`obj_ids` | `out_obj_ids`) — upstream emits `out_obj_ids`;
-  without this, MaskTracks silently falls back to channel-index identity.
+- Node-layer compat:
+  - `sam3_video_nodes.py` obj_ids extraction made key-tolerant
+    (`obj_ids` | `out_obj_ids`) — upstream emits `out_obj_ids`; without this,
+    MaskTracks silently falls back to channel-index identity.
+  - `load_model_v31.py` installs a **session-registry alias**
+    `_ALL_INFERENCE_STATES` -> `_all_inference_states` on the predictor.
+    `inference_reconstructor.py` (the D-239/D-240 cache-safety layer) reads the
+    live session dict as `_ALL_INFERENCE_STATES` (the fork's legacy
+    Sam3VideoPredictor name); upstream Sam3BasePredictor stores the SAME dict as
+    `_all_inference_states` and only mutates it in place. Aliasing the two names
+    to one dict object fixes the propagate-time crash
+    (`'SAM3UnifiedModel' object has no attribute '_ALL_INFERENCE_STATES'`).
+    Runtime-found 2026-06-10: model loaded clean (64 missing keys = RoPE
+    freqs_cis buffers, regenerated — benign), crashed only here.
+- KNOWN DEFERRED GAPS (not on the text/point smoke path; fix when hit):
+  1. `add_new_mask` — upstream Sam3BasePredictor does NOT expose it; the fork's
+     reconstructor calls it for MASK-type prompts (chunked video continuation).
+     Needs a multiplex mask-add path before chunked/mask-seeded workflows run.
+  2. `_apply_config` config knobs: `score_threshold_detection`, `assoc_iou_thresh`,
+     `det_nms_thresh`, `init_trk_keep_alive` appear renamed/relocated on the
+     multiplex tracking model — setting them is harmless (no crash) but becomes a
+     no-op, so those tuning levers don't bite on 3.1 yet. Reconcile names for
+     quality tuning. Builder defaults (score_threshold_detection=0.4 etc.) govern
+     meanwhile.
 - Import smoke PASSED on Windows embedded python (no triton, no flash-attn):
   package import + multiplex predictor + builder + Sam3Processor.
 - Recovered legacy fixes: NOT yet ported beyond edt.py (see

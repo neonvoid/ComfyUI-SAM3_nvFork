@@ -62,16 +62,25 @@ diff bisection — do not repeat that.
   - `sam3_video_nodes.py` obj_ids extraction made key-tolerant
     (`obj_ids` | `out_obj_ids`) — upstream emits `out_obj_ids`; without this,
     MaskTracks silently falls back to channel-index identity.
-  - `load_model_v31.py` installs a **session-registry alias**
-    `_ALL_INFERENCE_STATES` -> `_all_inference_states` on the predictor.
-    `inference_reconstructor.py` (the D-239/D-240 cache-safety layer) reads the
-    live session dict as `_ALL_INFERENCE_STATES` (the fork's legacy
-    Sam3VideoPredictor name); upstream Sam3BasePredictor stores the SAME dict as
-    `_all_inference_states` and only mutates it in place. Aliasing the two names
-    to one dict object fixes the propagate-time crash
-    (`'SAM3UnifiedModel' object has no attribute '_ALL_INFERENCE_STATES'`).
-    Runtime-found 2026-06-10: model loaded clean (64 missing keys = RoPE
-    freqs_cis buffers, regenerated — benign), crashed only here.
+  - `sam3_v31_compat.py` `apply_node_layer_compat(predictor)` (called from
+    `load_model_v31.py`) patches a freshly-built multiplex predictor IN PLACE
+    with two additive shims (vendored code stays pristine). Both runtime-found
+    2026-06-10 (model loads clean — 64 missing keys = regenerated RoPE freqs_cis
+    buffers, benign — and crashes only in the node layer):
+      1. **session-registry alias** `_ALL_INFERENCE_STATES` -> `_all_inference_states`.
+         inference_reconstructor.py (D-239/D-240 cache-safety) reads the live
+         session dict by the fork's legacy name (upper); upstream Sam3BasePredictor
+         stores the SAME dict as `_all_inference_states` (lower), mutated in place.
+         Fixes `'SAM3UnifiedModel' object has no attribute '_ALL_INFERENCE_STATES'`.
+      2. **start_session kwarg-filter**. Upstream Sam3BasePredictor.start_session
+         forwards `offload_state_to_cpu` (+ maybe `video_loader_type`) to
+         `model.init_state()`, but multiplex init_state =
+         (resource_path, offload_video_to_cpu, async_loading_frames, use_torchcodec,
+         use_cv2, input_is_mp4) rejects them. Replaced with a version that filters
+         init_state kwargs to the accepted set (mirrors upstream's own
+         add_prompt/propagate filtering + fork-3.0 behavior of stashing
+         offload_state_to_cpu on the state). Fixes
+         `init_state() got an unexpected keyword argument 'offload_state_to_cpu'`.
 - KNOWN DEFERRED GAPS (not on the text/point smoke path; fix when hit):
   1. `add_new_mask` — upstream Sam3BasePredictor does NOT expose it; the fork's
      reconstructor calls it for MASK-type prompts (chunked video continuation).

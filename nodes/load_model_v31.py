@@ -165,25 +165,12 @@ class LoadSAM31Model:
             compile=torch_compile,
         )
 
-        # --- Node-layer compat shim: session-registry alias ---------------------
-        # nodes/inference_reconstructor.py drives the predictor through the fork's
-        # legacy Sam3VideoPredictor API, which exposes the live session registry as
-        # `_ALL_INFERENCE_STATES` (upper). Upstream Sam3BasePredictor stores the SAME
-        # registry as the instance attr `_all_inference_states` (lower) and only ever
-        # mutates it in place (start_session/close_session/clear — never reassigns
-        # after __init__). Alias the two names to the SAME dict object so the
-        # reconstructor's reads and the predictor's writes stay in sync. Without this:
-        # `'SAM3UnifiedModel' object has no attribute '_ALL_INFERENCE_STATES'` at
-        # propagate time. (add_new_mask + a few renamed config knobs remain TODO —
-        # not on the text/point path; see VENDORED_FROM.md.)
-        if hasattr(predictor, "_all_inference_states") and not hasattr(predictor, "_ALL_INFERENCE_STATES"):
-            predictor._ALL_INFERENCE_STATES = predictor._all_inference_states
-            print(f"{_PREFIX} Session-registry alias _ALL_INFERENCE_STATES -> _all_inference_states installed.")
-        else:
-            print(f"{_PREFIX} WARN: could not install session-registry alias "
-                  f"(has _all={hasattr(predictor, '_all_inference_states')}, "
-                  f"has _ALL={hasattr(predictor, '_ALL_INFERENCE_STATES')}). "
-                  f"Propagation may fail in inference_reconstructor.")
+        # --- Node-layer compatibility shims -------------------------------------
+        # Make the upstream multiplex predictor satisfy the contract that
+        # inference_reconstructor.py + sam3_video_nodes.py expect (session-registry
+        # name alias + start_session kwarg-filtering). See sam3_v31_compat.py.
+        from .sam3_v31_compat import apply_node_layer_compat
+        apply_node_layer_compat(predictor)
 
         # Image-mode processor: best-effort. The multiplex detector may not be
         # drop-in compatible with Sam3Processor's image pipeline — video nodes

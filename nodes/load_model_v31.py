@@ -124,7 +124,7 @@ class LoadSAM31Model:
                    use_fa3=False, torch_compile=False):
         if not torch.cuda.is_available():
             raise RuntimeError(
-                f"{_PREFIX} SAM 3.1 multiplex requires CUDA — the upstream builder "
+                f"{_PREFIX} SAM 3.1 multiplex requires CUDA - the upstream builder "
                 f"moves the model to GPU unconditionally. No CUDA device is available."
             )
 
@@ -210,8 +210,41 @@ class LoadSAM31Model:
             load_device=load_device,
             offload_device=offload_device,
         )
-        print(f"{_PREFIX} SAM 3.1 multiplex model ready "
-              f"(size: {unified.model_size() / 1024 / 1024:.1f} MB)")
+
+        # --- Clean, copy-paste-ready LOAD SUMMARY ------------------------------
+        # The upstream builder prints a wrapped `Missing keys (N): [...]` line
+        # above; that's expected (RoPE freqs_cis buffers, regenerated). This
+        # block is the authoritative one-glance verdict — paste THIS, ignore the
+        # raw scroll. For deeper state, drop an "NV SAM3 Diagnostics" node.
+        def _has(name):
+            return hasattr(predictor, name)
+        api = [a for a in ("start_session", "add_prompt", "add_new_mask",
+                           "propagate_in_video", "close_session",
+                           "handle_stream_request")
+               if _has(a)]
+        api_missing = [a for a in ("add_new_mask",) if not _has(a)]
+        size_mb = unified.model_size() / 1024 / 1024
+        summary = "\n".join([
+            "", "=" * 10 + " [SAM31] LOAD SUMMARY (copy below) " + "=" * 10,
+            f"version        : SAM 3.1 multiplex",
+            f"checkpoint     : {ckpt.name} ({ckpt.suffix})",
+            f"predictor      : {type(predictor).__name__}",
+            f"model          : {type(predictor.model).__name__}",
+            f"multiplex/maxobj: {multiplex_count}/{max_num_objects}  fa3={use_fa3}  compile={torch_compile}",
+            f"session alias  : {'installed' if _has('_ALL_INFERENCE_STATES') else 'MISSING (propagate will crash)'}",
+            f"image processor: {'ready' if processor is not None else 'unavailable (video path OK)'}",
+            f"predictor API  : {' '.join(api)}",
+            f"API gaps       : {(' '.join(api_missing)) or 'none on smoke path'}  "
+            f"(add_new_mask only needed for chunked/mask prompts)",
+            f"state-dict keys: see upstream 'Missing keys' line above - expected RoPE "
+            f"freqs_cis buffers (regenerated, benign)",
+            f"size / device  : {size_mb:.1f} MB / {load_device}",
+            "=" * 54, "",
+        ])
+        try:
+            print(summary)
+        except Exception:  # noqa: BLE001 — never let a console-encoding issue fail the load
+            print(summary.encode("ascii", "replace").decode("ascii"))
         return (unified,)
 
 

@@ -47,6 +47,8 @@ def apply_node_layer_compat(predictor):
         notes.append("session-registry alias")
     if _patch_start_session(predictor):
         notes.append("start_session kwarg-filter")
+    if _patch_add_new_mask_guard(predictor):
+        notes.append("add_new_mask guard")
     print(f"{_PREFIX} applied: {', '.join(notes) if notes else '(nothing — already compatible?)'}")
     return predictor
 
@@ -107,4 +109,34 @@ def _patch_start_session(predictor) -> bool:
         return {"session_id": session_id}
 
     predictor.start_session = types.MethodType(start_session, predictor)
+    return True
+
+
+def _patch_add_new_mask_guard(predictor) -> bool:
+    """Install a legible-error add_new_mask on predictors that lack it.
+
+    inference_reconstructor._apply_prompt calls model.add_new_mask(...) for
+    MASK-type prompts (chunked mask-guided continuation). Upstream
+    Sam3BasePredictor has no add_new_mask, so this would otherwise raise a bare
+    AttributeError deep in the stack. The multiplex model DOES expose a real
+    mask-add path (Sam3Multiplex*.add_new_masks / add_new_masks_to_existing_state)
+    that a future shim can wire to; until then, fail with a clear pointer instead
+    of a confusing crash. Not on the text/point smoke path.
+    """
+    if hasattr(predictor, "add_new_mask"):
+        return False  # something already provides it — leave alone
+
+    def add_new_mask(self, session_id, frame_idx, obj_id, mask, *args, **kwargs):
+        raise NotImplementedError(
+            "[SAM31] add_new_mask is not yet wired for the SAM 3.1 multiplex "
+            "predictor. This path is only used by chunked / mask-guided "
+            "continuation (SAM3 chunked video). The upstream multiplex mask-add "
+            "method exists (sam3_lib_v31 video_tracking_multiplex.add_new_masks_"
+            "to_existing_state / video_tracking_multiplex_demo.add_new_masks) and "
+            "needs a thin adapter in sam3_v31_compat.py. Text/point/box prompts "
+            "work without this. (session={}, frame={}, obj={})".format(
+                session_id, frame_idx, obj_id)
+        )
+
+    predictor.add_new_mask = types.MethodType(add_new_mask, predictor)
     return True

@@ -9,5 +9,7 @@ local_modifications:
   - "import rewrite: all `sam3.` absolute imports -> `sam3_v31.` (coexistence with frozen nodes/sam3_lib); sys.modules alias registered in __init__.py"
   - "pkg_resources.resource_filename package arg 'sam3' -> 'sam3_v31' (3 sites in model_builder.py; defensive only — loader always passes bpe_path)"
   - "__init__.py rewritten: alias registration + multiplex builder exports"
+  - "model/edt.py replaced with the frozen 3.0 lib's triton-guarded version (try/except import + torch fallback edt_triton) so it runs without triton on Windows; only module-level triton import on the multiplex hot path"
+  - "model/decoder.py:1014 (Blackwell/SDPA compat, runtime-found 2026-06-10): functional_attention non-FA3 path was `sdpa_kernel(SDPBackend.FLASH_ATTENTION)` (flash-only) -> 'No available kernel. Aborting execution.' on sm_120 / fp32 inputs. Widened to [FLASH, EFFICIENT_ATTENTION, MATH] fallback list (matches vl_combiner.py's existing pattern). Flash still preferred when available."
 recovered_legacy_fixes_ported: []  # NONE yet — evaluate nodes/sam3_vendor/patches/recovered/ against this snapshot before porting (some may be fixed upstream)
 excluded: []  # full upstream sam3/ package vendored (5.1MB incl. train/ — model/ imports train.masks_ops + train.data.collator)

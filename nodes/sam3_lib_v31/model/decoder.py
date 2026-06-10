@@ -1011,7 +1011,14 @@ def functional_attention(
         assert dropout == 0.0
         out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     else:
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        # nvFork local patch (Blackwell/SDPA compat): upstream pinned this to
+        # FLASH_ATTENTION only, which aborts with "No available kernel" when the
+        # flash SDPA kernel can't service the call (e.g. sm_120 Blackwell kernel
+        # availability, or fp32 inputs from an fp32 .pt checkpoint — flash SDPA is
+        # fp16/bf16 only). Allow the full backend set so PyTorch falls back to
+        # mem-efficient/math; matches vl_combiner.py's existing pattern. Flash is
+        # still used when available (the dispatcher prefers it).
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
             out = torchF.scaled_dot_product_attention(q, k, v, dropout_p=dropout)
         out = out.transpose(1, 2)  #  B * n * n_heads * (cv // num_heads)
 

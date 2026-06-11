@@ -792,6 +792,30 @@ class SAM3VideoSegmentation:
                         print(f"[SAM3 Video] Added point prompt: obj={obj_id}, "
                               f"positive={len(pos_pts)}, negative={len(neg_pts)}")
 
+                    # Optional per-object box ([cx, cy, w, h] normalized, e.g. from
+                    # NV_SAM3SeedBuilder.init_points_prompt). Convert to xyxy corners
+                    # (VideoPrompt.create_box contract) and chain it -- SAM3 merges
+                    # box+points for the same (frame, obj) into one stronger prompt.
+                    box_raw = obj_data.get("box")
+                    if box_raw and len(box_raw) == 4 and all_points:
+                        try:
+                            bcx, bcy, bw, bh = (float(v) for v in box_raw)
+                            if bw > 0 and bh > 0:
+                                bx1 = max(0.0, min(1.0, bcx - bw / 2.0))
+                                by1 = max(0.0, min(1.0, bcy - bh / 2.0))
+                                bx2 = max(0.0, min(1.0, bcx + bw / 2.0))
+                                by2 = max(0.0, min(1.0, bcy + bh / 2.0))
+                                if bx2 > bx1 and by2 > by1:
+                                    box_prompt = VideoPrompt.create_box(
+                                        frame_idx, obj_id, [bx1, by1, bx2, by2], is_positive=True
+                                    )
+                                    video_state = video_state.with_prompt(box_prompt)
+                                    print(f"[SAM3 Video] Added box prompt: obj={obj_id} "
+                                          f"(merged with points at apply)")
+                        except (TypeError, ValueError) as e:
+                            print(f"[SAM3 Video] WARN: skipping malformed box for "
+                                  f"obj={obj_id}: {box_raw!r} ({e})")
+
                 if len(positive_points["objects"]) == 0:
                     print("[SAM3 Video] Warning: point mode selected but no objects in multi-object data")
             else:

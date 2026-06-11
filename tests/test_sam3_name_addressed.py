@@ -330,5 +330,39 @@ def test_router_missing_name_empty_warn_zero_lane_excluded():
     assert masks_batch.shape[0] == 2
 
 
+def test_select_by_name_on_3d_mask_raises(  # review fix: 3D + name mode must fail loud
+):
+    """select_by=name against a pre-squeezed 3D [F,H,W] mask must raise, not
+    silently return the mask as-is (it can't resolve a channel)."""
+    _all, track_info_json, _q = _build_head_body_hair()
+    node = SAM3SelectMask()
+    mask_3d = torch.zeros(2, 4, 4)  # [F, H, W]
+    with pytest.raises(ValueError, match="requires the 4D multi-object"):
+        node.select(mask_3d, select_by="name", subject_names="head", track_info=track_info_json)
+
+
+def test_select_by_name_negative_channel_in_track_info_raises():
+    """A malformed track_info mapping a name to a NEGATIVE channel must raise,
+    not silently select the last object via Python negative-index wraparound."""
+    all_masks, _ti, _q = _build_head_body_hair()
+    bad = json.dumps({"subject_to_obj_id": {"phantom": 9}, "obj_id_to_channel": {"9": -1}})
+    node = SAM3SelectMask()
+    with pytest.raises(ValueError, match="different runs"):
+        node.select(all_masks, select_by="name", subject_names="phantom", track_info=bad)
+
+
+def test_router_negative_channel_in_track_info_raises():
+    all_masks, _ti, _q = _build_head_body_hair()
+    bad = json.dumps({"subject_to_obj_id": {"phantom": 9}, "obj_id_to_channel": {"9": -1}})
+    node = SAM3MaskRouter()
+    with pytest.raises(ValueError, match="different runs"):
+        node.route_masks(
+            all_masks, track_info=bad,
+            slot_1_name="phantom", slot_2_name="", slot_3_name="",
+            slot_4_name="", slot_5_name="", slot_6_name="",
+            slot_7_name="", slot_8_name="",
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

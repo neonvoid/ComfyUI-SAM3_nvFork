@@ -877,7 +877,17 @@ class SAM3SelectMask:
         """
         # Handle different input shapes
         if all_masks.dim() == 3:
-            # Already [N_frames, H, W] - single object, just return
+            # Already [N_frames, H, W] - single object. Name mode can't resolve a
+            # channel against a pre-squeezed single-object tensor, so fail loud
+            # rather than silently returning whatever mask was wired (review fix).
+            if select_by == "name":
+                raise ValueError(
+                    "[SAM3 SelectMask] select_by=name requires the 4D multi-object "
+                    "tensor [N_frames, N_objects, H, W] from NV_SAM3MaskTracks.all_masks; "
+                    "got a 3D [N_frames, H, W] mask (already a single object). Wire "
+                    "all_masks (not a downstream squeezed mask), or use select_by=id."
+                )
+            # Single object, just return
             print(f"[SAM3 SelectMask] Input is single-object mask, returning as-is")
             num_frames, h, w = all_masks.shape
             # Create visualization if frames provided
@@ -918,7 +928,9 @@ class SAM3SelectMask:
                         continue
                     raise
                 # Stale-mismatch guard: track_info channel must index this tensor.
-                if ch >= num_objects:
+                # Reject negatives too (a malformed track_info channel of -1 would
+                # otherwise silently select the LAST object via Python wraparound).
+                if ch < 0 or ch >= num_objects:
                     raise ValueError(
                         f"[SAM3 SelectMask] Subject '{nm}' maps to channel {ch} but "
                         f"all_masks has only {num_objects} channels. track_info and "
@@ -1857,7 +1869,7 @@ class SAM3MaskRouter:
                     lane_masks.append(zero_lane)
                     continue
                 raise ValueError(f"[SAM3 MaskRouter] slot {i+1}: {e}")
-            if ch >= num_objects:
+            if ch < 0 or ch >= num_objects:
                 raise ValueError(
                     f"[SAM3 MaskRouter] slot {i+1} '{nm}' maps to channel {ch} but "
                     f"mask_tracks has only {num_objects} channels. track_info and "

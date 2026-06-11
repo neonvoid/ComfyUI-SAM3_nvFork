@@ -1967,6 +1967,22 @@ class SAM3Propagate:
                         if outputs is None:
                             continue
 
+                        # DIAGNOSTIC: log the raw per-frame output keys (+ obj_id_to_mask
+                        # presence) on the first few frames so we see exactly which key
+                        # carries obj_ids on bare propagation frames. The multiplex
+                        # _postprocess_output builds out_obj_ids + out_binary_masks from
+                        # obj_id_to_mask; this confirms what actually reaches the wrapper.
+                        if backfill_debug_logged < 4 and isinstance(outputs, dict):
+                            _o2m = outputs.get("obj_id_to_mask")
+                            print(
+                                f"[SAM3 Video][bf-debug] frame={frame_idx} "
+                                f"outputs.keys={sorted(outputs.keys())} "
+                                f"obj_id_to_mask={'dict len='+str(len(_o2m)) if isinstance(_o2m, dict) else type(_o2m).__name__} "
+                                f"out_obj_ids={type(outputs.get('out_obj_ids')).__name__}/"
+                                f"{outputs.get('out_obj_ids') if not hasattr(outputs.get('out_obj_ids'), 'shape') else getattr(outputs.get('out_obj_ids'), 'shape', None)}"
+                            )
+                            backfill_debug_logged += 1
+
                         # Try different possible mask keys
                         mask_key = None
                         for key in ["out_binary_masks", "video_res_masks", "masks"]:

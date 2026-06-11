@@ -1936,6 +1936,18 @@ class SAM3Propagate:
             initial_obj_bboxes = {}  # {obj_id: [x1, y1, x2, y2]} - last known bbox per initial object
             id_remap = {}  # {new_id: original_id} - persistent ID remapping
 
+            # Multiplex obj_ids backfill (SAM 3.1): the multiplex SAM2-merge
+            # propagation path emits obj_ids metadata only on PROMPT frames; pure
+            # propagation frames arrive with masks but no obj_ids, so MaskTracks
+            # (correctly) skips them and only the prompt frames survive -> masks
+            # appear on a handful of frames only. The multiplex demux preserves
+            # channel order across frames, so the last frame that DID carry obj_ids
+            # gives the canonical channel->obj_id map; carry it forward onto the
+            # bare frames. Guarded by an exact mask-channel-count match so a changed
+            # object count (entered/left) is left unset rather than mis-mapped.
+            last_known_obj_ids = None
+            backfilled_obj_id_frames = 0
+
             autocast_context = _get_autocast_context()
             with autocast_context:
                 print_vram("Before reconstruction (in autocast)")
@@ -2057,6 +2069,27 @@ class SAM3Propagate:
                                     except Exception:
                                         pass  # Non-critical: keep old bboxes
 
+                            # Multiplex obj_ids backfill (see init above). Update the
+                            # canonical map from any frame that carries obj_ids; carry
+                            # it onto bare frames whose mask channel count matches.
+                            if frame_obj_ids:
+                                last_known_obj_ids = list(frame_obj_ids)
+                            elif last_known_obj_ids is not None and mask is not None and hasattr(mask, "shape"):
+                                _shape = tuple(mask.shape)
+                                _nd = len(_shape)
+                                if _nd == 3:
+                                    _nch = _shape[0]
+                                elif _nd == 4:
+                                    _nch = _shape[1] if _shape[0] == 1 else _shape[0]
+                                elif _nd == 2:
+                                    _nch = 1
+                                else:
+                                    _nch = 0
+                                if _nch == len(last_known_obj_ids):
+                                    frame_obj_ids = list(last_known_obj_ids)
+                                    obj_ids_dict[frame_idx] = frame_obj_ids
+                                    backfilled_obj_id_frames += 1
+
                             # Bundle mask and obj_ids together for automatic color stability
                             masks_dict[frame_idx] = {
                                 "mask": mask,
@@ -2134,6 +2167,12 @@ class SAM3Propagate:
             print_vram("After propagation loop")
             print(f"[SAM3 Video] Propagation complete: {len(masks_dict)} frames processed")
             print(f"[SAM3 Video] Frames with scores: {len(scores_dict)}")
+            if backfilled_obj_id_frames:
+                print(
+                    f"[SAM3 Video] Backfilled obj_ids onto {backfilled_obj_id_frames} "
+                    f"multiplex propagation frame(s) (channel-count matched) so "
+                    f"MaskTracks keeps them instead of skipping."
+                )
 
             # Handle early exit: truncate output and create metadata
             if auto_exit_on_empty:

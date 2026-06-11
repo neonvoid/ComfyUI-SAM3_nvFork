@@ -1947,6 +1947,7 @@ class SAM3Propagate:
             # object count (entered/left) is left unset rather than mis-mapped.
             last_known_obj_ids = None
             backfilled_obj_id_frames = 0
+            backfill_debug_logged = 0  # DIAGNOSTIC: cap bare-frame shape logs
 
             autocast_context = _get_autocast_context()
             with autocast_context:
@@ -2085,6 +2086,18 @@ class SAM3Propagate:
                                     _nch = 1
                                 else:
                                     _nch = 0
+                                # DIAGNOSTIC: surface the bare-frame mask structure on
+                                # the first few occurrences so we can see why the guard
+                                # matches or not (mask may be merged/single-channel, or
+                                # padded to a fixed slot count). Remove once resolved.
+                                if backfill_debug_logged < 3:
+                                    print(
+                                        f"[SAM3 Video][bf-debug] frame={frame_idx} "
+                                        f"bare-mask shape={_shape} type={type(mask).__name__} "
+                                        f"n_ch={_nch} last_known_obj_ids={last_known_obj_ids} "
+                                        f"(match={_nch == len(last_known_obj_ids)})"
+                                    )
+                                    backfill_debug_logged += 1
                                 if _nch == len(last_known_obj_ids):
                                     frame_obj_ids = list(last_known_obj_ids)
                                     obj_ids_dict[frame_idx] = frame_obj_ids

@@ -235,10 +235,173 @@ class LoadSAM31Model:
         return (unified,)
 
 
+class LoadSAM31TrackerModel(LoadSAM31Model):
+    """Load the SAM 3.1 TRACKER (PVS) predictor -- the interactive point/box path.
+
+    SAM 3 ships TWO inference contracts (paper arXiv:2511.16719 sec 2-3 + HF
+    facebook/sam3 model card):
+      - PCS (Promptable Concept Segmentation) = the MULTIPLEX predictor
+        (LoadSAM31Model). TEXT/exemplar driven: detects + tracks ALL instances of
+        a concept. Its VG state machine (hotstart / new_det_thresh / assoc_iou /
+        masklet confirmation) SUPPRESSES objects not confirmed by recurring text
+        detections -- so purely point-prompted objects vanish off prompt frames
+        (field-verified 2026-06-11: out_obj_ids=(0,) on every bare frame).
+      - PVS (Promptable Visual Segmentation) = THIS loader. SAM2-style dense
+        tracker (Sam3VideoPredictor -> Sam3VideoInferenceWithInstanceInteractivity):
+        interactive point/box objects are first-class and propagate across the
+        whole video. This is the same contract as the proven 3.0 workflow, with
+        the v31 code line.
+
+    Use THIS loader for the seed-driven multi-region flow (NV_SAM3SeedBuilder
+    points -> SAM3VideoSegmentation -> SAM3MultiFrameAddPrompt -> SAM3Propagate).
+    Use LoadSAM31Model (multiplex) for text-concept detect-and-track.
+
+    Checkpoint: the dense tracker uses the BASE SAM3 weights (sam3.pt family),
+    NOT sam3.1_multiplex.pt (multiplex-specific memory-encoder weights).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_path": ("STRING", {
+                    "default": "models/sam3/sam3.pt",
+                    "tooltip": (
+                        "Path to the BASE SAM3 checkpoint (sam3.pt / safetensors). "
+                        "Relative paths resolve against the ComfyUI base dir. Do NOT "
+                        "point this at sam3.1_multiplex.pt -- the multiplex weights "
+                        "belong to LoadSAM31Model (PCS)."
+                    ),
+                }),
+            },
+            "optional": {
+                "strict_state_dict": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "Strict checkpoint key matching. If the load fails with "
+                        "missing/unexpected keys (minor upstream drift between the "
+                        "3.0 checkpoint and the v31 code), set False and check the "
+                        "LOAD SUMMARY for what was skipped."
+                    ),
+                }),
+                "torch_compile": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "torch.compile the model (slow first run; leave off while validating).",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("SAM3_MODEL",)
+    RETURN_NAMES = ("sam3_model",)
+    FUNCTION = "load_model"
+    CATEGORY = "SAM3"
+    DESCRIPTION = (
+        "Load SAM 3.1 TRACKER (PVS) -- the SAM2-style interactive point/box video "
+        "tracker. Point-prompted objects propagate across the whole video (unlike "
+        "the multiplex/PCS loader, whose concept state machine suppresses them). "
+        "Pair with NV_SAM3SeedBuilder for automated multi-region tracking."
+    )
+
+    def load_model(self, model_path, strict_state_dict=True, torch_compile=False):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"{_PREFIX} SAM 3.1 tracker requires CUDA - the upstream builder "
+                f"moves the model to GPU unconditionally. No CUDA device is available."
+            )
+
+        ckpt = self._resolve_path(model_path)
+        if not ckpt.exists():
+            raise FileNotFoundError(
+                f"{_PREFIX} Checkpoint not found: {ckpt}\n"
+                f"This loader wants the BASE SAM3 weights (sam3.pt), the same file "
+                f"the 3.0 LoadSAM3Model uses. Place it at <ComfyUI>/models/sam3/ or "
+                f"give an absolute path."
+            )
+        if "multiplex" in ckpt.name.lower():
+            raise ValueError(
+                f"{_PREFIX} {ckpt.name} looks like the MULTIPLEX (PCS) checkpoint. "
+                f"The tracker (PVS) loader needs the base sam3.pt weights -- the "
+                f"multiplex memory-encoder keys will not match the dense tracker."
+            )
+        ckpt = self._ensure_pt(ckpt)
+
+        # Lazy import (same discipline as the multiplex loader).
+        from .sam3_lib_v31.model.sam3_video_predictor import Sam3VideoPredictor
+
+        bpe_path = Path(__file__).parent / "sam3_lib_v31" / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+        load_device = comfy.model_management.get_torch_device()
+        offload_device = comfy.model_management.unet_offload_device()
+
+        print(f"{_PREFIX} Building SAM 3.1 TRACKER (PVS / dense) predictor "
+              f"(strict={strict_state_dict}, compile={torch_compile})")
+        print(f"{_PREFIX} Checkpoint: {ckpt}")
+
+        predictor = Sam3VideoPredictor(
+            checkpoint_path=str(ckpt),
+            bpe_path=str(bpe_path),
+            strict_state_dict_loading=strict_state_dict,
+            compile=torch_compile,
+        )
+
+        # Same node-layer shims as the multiplex loader (registry alias +
+        # start_session kwarg-filter). Each shim no-ops where the predictor
+        # already satisfies the contract.
+        from .sam3_v31_compat import apply_node_layer_compat
+        apply_node_layer_compat(predictor)
+
+        processor = None
+        try:
+            from .sam3_lib_v31.model.sam3_image_processor import Sam3Processor
+            processor = Sam3Processor(
+                model=predictor.model.detector,
+                resolution=1008,
+                device=str(load_device),
+                confidence_threshold=0.2,
+            )
+            print(f"{_PREFIX} Sam3Processor (image mode) created.")
+        except Exception as e:  # noqa: BLE001 — diagnostic fallback, video path unaffected
+            print(f"{_PREFIX} WARN: image-mode Sam3Processor unavailable "
+                  f"({type(e).__name__}: {e}). Video tracking nodes unaffected.")
+
+        unified = SAM3UnifiedModel(
+            video_predictor=predictor,
+            processor=processor,
+            load_device=load_device,
+            offload_device=offload_device,
+        )
+
+        def _has(name):
+            return hasattr(predictor, name)
+        api = [a for a in ("start_session", "add_prompt", "add_new_mask",
+                           "propagate_in_video", "close_session",
+                           "handle_stream_request")
+               if _has(a)]
+        size_mb = unified.model_size() / 1024 / 1024
+        summary = "\n".join([
+            "", "=" * 10 + " [SAM31] LOAD SUMMARY (copy below) " + "=" * 10,
+            f"version        : SAM 3.1 TRACKER (PVS / dense, point-box path)",
+            f"checkpoint     : {ckpt.name} ({ckpt.suffix})",
+            f"predictor      : {type(predictor).__name__}",
+            f"model          : {type(predictor.model).__name__}",
+            f"session alias  : {'installed' if _has('_ALL_INFERENCE_STATES') else 'MISSING (propagate will crash)'}",
+            f"image processor: {'ready' if processor is not None else 'unavailable (video path OK)'}",
+            f"predictor API  : {' '.join(api)}",
+            f"size / device  : {size_mb:.1f} MB / {load_device}",
+            "=" * 54, "",
+        ])
+        try:
+            print(summary)
+        except Exception:  # noqa: BLE001
+            print(summary.encode("ascii", "replace").decode("ascii"))
+        return (unified,)
+
+
 NODE_CLASS_MAPPINGS = {
     "LoadSAM31Model": LoadSAM31Model,
+    "LoadSAM31TrackerModel": LoadSAM31TrackerModel,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "LoadSAM31TrackerModel": "Load SAM 3.1 Tracker (PVS Points)",
     "LoadSAM31Model": "Load SAM 3.1 Model (Multiplex)",
 }
